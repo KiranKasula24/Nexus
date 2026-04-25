@@ -1,0 +1,7 @@
+version: "2"
+tunnels:
+  nexus:
+    proto: http
+    addr: 3000
+    schemes:
+      - https

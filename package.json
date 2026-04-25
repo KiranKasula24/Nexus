@@ -1,0 +1,36 @@
+{
+  "name": "nexus",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "dev:host": "next dev --hostname 0.0.0.0",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "share": "ngrok start --config ngrok.yml nexus"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "jsqr": "^1.4.0",
+    "next": "16.2.4",
+    "pako": "^2.1.0",
+    "qrcode": "^1.5.4",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/pako": "^2.0.4",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "babel-plugin-react-compiler": "1.0.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.4",
+    "ngrok": "^5.0.0-beta.2",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
