@@ -66,6 +66,10 @@ function classNames(...parts: Array<string | false | null | undefined>): string 
   return parts.filter(Boolean).join(" ");
 }
 
+function pressableCardClasses(base: string): string {
+  return `${base} transition duration-150 active:scale-[0.98] active:shadow-sm`;
+}
+
 function toneClasses(tone: StatusTone): string {
   if (tone === "active") return "bg-emerald-100 text-emerald-900";
   if (tone === "warning") return "bg-amber-100 text-amber-900";
@@ -924,7 +928,9 @@ export function NexusApp() {
             <button
               type="button"
               onClick={() => setSettingsOpen(true)}
-              className="rounded-2xl border border-[#d7cfbe] bg-white/70 px-3 py-2 text-sm font-semibold text-[#102033]"
+              className={pressableCardClasses(
+                "rounded-2xl border border-[#d7cfbe] bg-white/70 px-3 py-2 text-sm font-semibold text-[#102033]",
+              )}
             >
               Settings
             </button>
@@ -956,34 +962,13 @@ export function NexusApp() {
 
           {section === "relay" && (
             <section className="mt-6 space-y-4">
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                <article className="rounded-[1.4rem] bg-[#102033] p-4 text-white">
-                  <p className="text-xs uppercase tracking-[0.22em] text-white/60">
-                    Stored
-                  </p>
-                  <p className="mt-2 text-3xl font-semibold">{messages.length}</p>
-                </article>
-                <article className="rounded-[1.4rem] bg-[#e35631] p-4 text-white">
-                  <p className="text-xs uppercase tracking-[0.22em] text-white/60">
-                    Hot
-                  </p>
-                  <p className="mt-2 text-3xl font-semibold">{topHotCount}</p>
-                </article>
-                <article className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4 text-[#102033]">
-                  <p className="text-xs uppercase tracking-[0.22em] text-[#945f3d]">
-                    More
-                  </p>
-                  <p className="mt-2 text-lg font-semibold">
-                    {topWarmCount} medium / {topColdCount} low
-                  </p>
-                </article>
-              </div>
-
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <button
                   type="button"
                   onClick={() => void handleShowSnapshotQr()}
-                  className="rounded-[1.5rem] bg-[#102033] px-4 py-4 text-left text-white"
+                  className={pressableCardClasses(
+                    "rounded-[1.5rem] bg-[#102033] px-4 py-4 text-left text-white",
+                  )}
                 >
                   <span className="block text-xs uppercase tracking-[0.22em] text-white/60">
                     Share
@@ -995,7 +980,9 @@ export function NexusApp() {
                 <button
                   type="button"
                   onClick={() => setSection("connect")}
-                  className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/80 px-4 py-4 text-left text-[#102033]"
+                  className={pressableCardClasses(
+                    "rounded-[1.5rem] border border-[#d7cfbe] bg-white/80 px-4 py-4 text-left text-[#102033]",
+                  )}
                 >
                   <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
                     Nearby
@@ -1006,13 +993,39 @@ export function NexusApp() {
                 </button>
               </div>
 
+              <div className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4 text-[#102033]">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.22em] text-[#945f3d]">
+                      Messages
+                    </p>
+                    <p className="mt-2 text-lg font-semibold">
+                      {messages.length === 0
+                        ? "No saved messages yet"
+                        : `${messages.length} saved`}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSection("compose")}
+                    className={pressableCardClasses(
+                      "rounded-full bg-[#102033] px-4 py-2 text-sm font-semibold text-white",
+                    )}
+                  >
+                    New
+                  </button>
+                </div>
+              </div>
+
               <div className="space-y-3">
                 {messages.map((message) => (
                   <button
                     key={message.id}
                     type="button"
                     onClick={() => setSelectedMessage(message)}
-                    className="w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left"
+                    className={pressableCardClasses(
+                      "w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left shadow-[0_10px_24px_rgba(16,32,51,0.06)]",
+                    )}
                   >
                     <div className="flex items-center justify-between gap-3">
                       <div className="flex items-center gap-3">
@@ -1055,6 +1068,29 @@ export function NexusApp() {
                     No messages stored yet. Compose one to start the relay.
                   </div>
                 )}
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <article className="rounded-[1.4rem] bg-[#102033] p-4 text-white">
+                  <p className="text-xs uppercase tracking-[0.22em] text-white/60">
+                    Saved
+                  </p>
+                  <p className="mt-2 text-3xl font-semibold">{messages.length}</p>
+                </article>
+                <article className="rounded-[1.4rem] bg-[#e35631] p-4 text-white">
+                  <p className="text-xs uppercase tracking-[0.22em] text-white/60">
+                    Hot
+                  </p>
+                  <p className="mt-2 text-3xl font-semibold">{topHotCount}</p>
+                </article>
+                <article className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4 text-[#102033]">
+                  <p className="text-xs uppercase tracking-[0.22em] text-[#945f3d]">
+                    More
+                  </p>
+                  <p className="mt-2 text-lg font-semibold">
+                    {topWarmCount} medium / {topColdCount} low
+                  </p>
+                </article>
               </div>
 
               {developerMode && (
@@ -1190,15 +1226,28 @@ export function NexusApp() {
           {section === "compose" && (
             <section className="mt-6 space-y-4">
               <div className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
-                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                  Compose
-                </p>
-                <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                  Write a message
-                </h2>
-                <p className="mt-2 text-sm text-[#5a6472]">
-                  Save keeps this message on your phone.
-                </p>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                      Compose
+                    </p>
+                    <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
+                      Write a message
+                    </h2>
+                    <p className="mt-2 text-sm text-[#5a6472]">
+                      Save keeps this message on your phone.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSection("relay")}
+                    className={pressableCardClasses(
+                      "rounded-full border border-[#d7cfbe] bg-white px-4 py-2 text-sm font-semibold text-[#102033]",
+                    )}
+                  >
+                    Back
+                  </button>
+                </div>
               </div>
 
               {draftSupersedes && (
@@ -1215,7 +1264,7 @@ export function NexusApp() {
                     type="button"
                     onClick={() => setDraftType(type)}
                     className={classNames(
-                      "rounded-[1.1rem] px-3 py-3 text-sm font-medium",
+                      "rounded-[1.1rem] px-3 py-3 text-sm font-medium transition duration-150 active:scale-[0.98]",
                       draftType === type
                         ? "bg-[#102033] text-white"
                         : "bg-white text-[#102033]",
@@ -1278,24 +1327,39 @@ export function NexusApp() {
           {section === "connect" && (
             <section className="mt-6 space-y-4">
               <div className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
-                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                  Hotspot Flow
-                </p>
-                <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                  Connect phones nearby
-                </h2>
-                <ol className="mt-3 space-y-2 text-sm text-[#5a6472]">
-                  <li>1. Put both phones on the same hotspot.</li>
-                  <li>2. On Phone 1, tap Make First QR.</li>
-                  <li>3. On Phone 2, tap Scan First QR.</li>
-                  <li>4. Show the second QR back to Phone 1.</li>
-                </ol>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                      Nearby
+                    </p>
+                    <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
+                      Connect phones nearby
+                    </h2>
+                    <ol className="mt-3 space-y-2 text-sm text-[#5a6472]">
+                      <li>1. Put both phones on the same hotspot.</li>
+                      <li>2. On Phone 1, tap Make First QR.</li>
+                      <li>3. On Phone 2, tap Scan First QR.</li>
+                      <li>4. Show the second QR back to Phone 1.</li>
+                    </ol>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSection("relay")}
+                    className={pressableCardClasses(
+                      "rounded-full border border-[#d7cfbe] bg-white px-4 py-2 text-sm font-semibold text-[#102033]",
+                    )}
+                  >
+                    Back
+                  </button>
+                </div>
               </div>
 
               <button
                 type="button"
                 onClick={() => void handleCreateOffer()}
-                className="w-full rounded-[1.5rem] bg-[#102033] px-4 py-5 text-left text-white"
+                className={pressableCardClasses(
+                  "w-full rounded-[1.5rem] bg-[#102033] px-4 py-5 text-left text-white",
+                )}
               >
                 <span className="block text-xs uppercase tracking-[0.22em] text-white/60">
                   Phone 1
@@ -1309,7 +1373,9 @@ export function NexusApp() {
                 <button
                   type="button"
                   onClick={() => openScanner("offer")}
-                  className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left text-[#102033]"
+                  className={pressableCardClasses(
+                    "rounded-[1.4rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left text-[#102033]",
+                  )}
                 >
                   <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
                     Phone 2
@@ -1322,7 +1388,9 @@ export function NexusApp() {
                 <button
                   type="button"
                   onClick={() => openScanner("answer")}
-                  className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left text-[#102033]"
+                  className={pressableCardClasses(
+                    "rounded-[1.4rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left text-[#102033]",
+                  )}
                 >
                   <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
                     Phone 1
@@ -1336,7 +1404,9 @@ export function NexusApp() {
               <button
                 type="button"
                 onClick={() => openScanner("snapshot")}
-                className="w-full rounded-[1.4rem] border border-dashed border-[#d7cfbe] bg-white px-4 py-4 text-left text-[#102033]"
+                className={pressableCardClasses(
+                  "w-full rounded-[1.4rem] border border-dashed border-[#d7cfbe] bg-white px-4 py-4 text-left text-[#102033]",
+                )}
               >
                   <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
                     Fallback
@@ -1365,13 +1435,13 @@ export function NexusApp() {
                 type="button"
                 onClick={() => setSection(item)}
                 className={classNames(
-                  "rounded-[1.1rem] px-3 py-3 text-sm font-medium capitalize",
+                  "rounded-[1.1rem] px-3 py-3 text-sm font-medium capitalize transition duration-150 active:scale-[0.98]",
                   section === item
                     ? "bg-[#102033] text-white"
                     : "text-[#5a6472]",
                 )}
               >
-                {item}
+                {item === "connect" ? "nearby" : item}
               </button>
             ))}
           </nav>
@@ -1386,18 +1456,20 @@ export function NexusApp() {
               <button
                 type="button"
                 onClick={() => setSettingsOpen(false)}
-                className="rounded-full bg-white px-3 py-2 text-sm text-[#102033]"
+                className={pressableCardClasses(
+                  "rounded-full bg-white px-3 py-2 text-sm text-[#102033]",
+                )}
               >
-                Close
+                Back
               </button>
             </div>
 
             <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
-              <button
-                type="button"
-                onClick={() => setSecuritySection("security")}
-                className={classNames(
-                  "rounded-[1rem] px-3 py-3 text-sm font-semibold",
+                <button
+                  type="button"
+                  onClick={() => setSecuritySection("security")}
+                  className={classNames(
+                  "rounded-[1rem] px-3 py-3 text-sm font-semibold transition duration-150 active:scale-[0.98]",
                   securitySection === "security"
                     ? "bg-[#102033] text-white"
                     : "bg-white text-[#102033]",
@@ -1405,11 +1477,11 @@ export function NexusApp() {
               >
                 Lock
               </button>
-              <button
-                type="button"
-                onClick={() => setSecuritySection("emergency")}
-                className={classNames(
-                  "rounded-[1rem] px-3 py-3 text-sm font-semibold",
+                <button
+                  type="button"
+                  onClick={() => setSecuritySection("emergency")}
+                  className={classNames(
+                  "rounded-[1rem] px-3 py-3 text-sm font-semibold transition duration-150 active:scale-[0.98]",
                   securitySection === "emergency"
                     ? "bg-[#102033] text-white"
                     : "bg-white text-[#102033]",
@@ -1417,11 +1489,11 @@ export function NexusApp() {
               >
                 Wipe
               </button>
-              <button
-                type="button"
-                onClick={() => setSecuritySection("developer")}
-                className={classNames(
-                  "rounded-[1rem] px-3 py-3 text-sm font-semibold",
+                <button
+                  type="button"
+                  onClick={() => setSecuritySection("developer")}
+                  className={classNames(
+                  "rounded-[1rem] px-3 py-3 text-sm font-semibold transition duration-150 active:scale-[0.98]",
                   securitySection === "developer"
                     ? "bg-[#102033] text-white"
                     : "bg-white text-[#102033]",
@@ -1492,8 +1564,23 @@ export function NexusApp() {
                 </button>
                 <button
                   type="button"
+                  onClick={() => {
+                    setDeveloperMode(false);
+                    setDevPanelOpen(false);
+                    setSettingsOpen(false);
+                  }}
+                  className={pressableCardClasses(
+                    "w-full rounded-[1.2rem] border border-[#d7cfbe] bg-white px-4 py-3 text-sm font-semibold text-[#102033]",
+                  )}
+                >
+                  Turn Debug Off
+                </button>
+                <button
+                  type="button"
                   onClick={() => void handleManualQuarantineDemo()}
-                  className="w-full rounded-[1.2rem] bg-white px-4 py-3 text-sm font-semibold text-[#102033]"
+                  className={pressableCardClasses(
+                    "w-full rounded-[1.2rem] bg-white px-4 py-3 text-sm font-semibold text-[#102033]",
+                  )}
                 >
                   Test Held Message
                 </button>
@@ -1522,9 +1609,11 @@ export function NexusApp() {
               <button
                 type="button"
                 onClick={() => setScannerMode(null)}
-                className="rounded-full bg-white/10 px-3 py-2 text-sm"
+                className={pressableCardClasses(
+                  "rounded-full bg-white/10 px-3 py-2 text-sm",
+                )}
               >
-                Close
+                Back
               </button>
             </div>
 
@@ -1578,9 +1667,11 @@ export function NexusApp() {
             <button
               type="button"
               onClick={closeQr}
-              className="mt-6 rounded-[1.3rem] bg-[#102033] px-6 py-3 text-sm font-semibold text-white"
+              className={pressableCardClasses(
+                "mt-6 rounded-[1.3rem] bg-[#102033] px-6 py-3 text-sm font-semibold text-white",
+              )}
             >
-              Close
+              Back
             </button>
           </div>
         </div>
@@ -1604,9 +1695,11 @@ export function NexusApp() {
               <button
                 type="button"
                 onClick={() => setSelectedMessage(null)}
-                className="rounded-full bg-white px-3 py-2 text-sm text-[#102033]"
+                className={pressableCardClasses(
+                  "rounded-full bg-white px-3 py-2 text-sm text-[#102033]",
+                )}
               >
-                Close
+                Back
               </button>
             </div>
 
