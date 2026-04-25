@@ -128,11 +128,11 @@ export async function createJoiner(
 ): Promise<{ peer: PeerArtifacts; answerToken: string }> {
   const connection = new RTCPeerConnection({ iceServers: [] });
   const offer = decodeWebRtcToken(offerToken);
-  await connection.setRemoteDescription(offer);
-
-  const channel = await new Promise<RTCDataChannel>((resolve) => {
+  const channelPromise = new Promise<RTCDataChannel>((resolve) => {
     connection.ondatachannel = (event) => resolve(event.channel);
   });
+  await connection.setRemoteDescription(offer);
+  const channel = await channelPromise;
 
   const answer = await connection.createAnswer();
   await connection.setLocalDescription(answer);

@@ -146,7 +146,7 @@ export function NexusApp() {
   const [draftSupersedes, setDraftSupersedes] = useState<string | undefined>();
 
   const [statusTone, setStatusTone] = useState<StatusTone>("ready");
-  const [statusText, setStatusText] = useState("Ready to relay");
+  const [statusText, setStatusText] = useState("Ready");
   const [syncText, setSyncText] = useState("Join the same hotspot, then connect");
   const [scannerStatus, setScannerStatus] = useState("Scanner idle");
   const [storageWarning, setStorageWarning] = useState("");
@@ -162,8 +162,7 @@ export function NexusApp() {
   const [sentinelStatus, setSentinelStatus] = useState("Sentinel idle");
   const [shakeArmed, setShakeArmed] = useState(false);
 
-  const [titleTapCount, setTitleTapCount] = useState(0);
-  const [developerUnlocked, setDeveloperUnlocked] = useState(false);
+  const developerUnlocked = true;
   const [developerMode, setDeveloperMode] = useState(false);
   const [devPanelOpen, setDevPanelOpen] = useState(false);
   const [devState, setDevState] = useState<DevState>(initialDevState);
@@ -356,28 +355,9 @@ export function NexusApp() {
   }
 
   function queueDeveloperUnlock(): void {
-    setTitleTapCount((current) => {
-      const next = current + 1;
-      if (next >= 6) {
-        setDeveloperUnlocked(true);
-        setSettingsOpen(true);
-        setSecuritySection("developer");
-        pushDevLog(
-          "active",
-          "Developer mode unlocked",
-          "Hidden developer controls are now available in Settings.",
-        );
-        return 0;
-      }
-      return next;
-    });
+    setSettingsOpen(true);
+    setSecuritySection("developer");
   }
-
-  useEffect(() => {
-    if (titleTapCount === 0) return undefined;
-    const timer = window.setTimeout(() => setTitleTapCount(0), 1400);
-    return () => window.clearTimeout(timer);
-  }, [titleTapCount]);
 
   function beginCompose(message?: NexusMessageWithComputed): void {
     if (message) {
@@ -447,8 +427,8 @@ export function NexusApp() {
         lastSnapshotPayload: snapshot.qr,
       }));
       await openQr(
-        "Snapshot QR",
-        "Share the relay engine's highest-ranked snapshot with another device.",
+        "Share QR",
+        "Share your top messages with another phone.",
         snapshot.qr,
         formatRelativeTone(
           "ready",
@@ -502,18 +482,54 @@ export function NexusApp() {
   ): Promise<void> {
     syncChannelRef.current = peer.channel;
 
+    peer.connection.onconnectionstatechange = () => {
+      const state = peer.connection.connectionState;
+      if (state === "connecting") {
+        setSyncText("Connecting phones...");
+        noteStatus("warning", "Connecting");
+      } else if (state === "connected") {
+        setSyncText("Phones connected.");
+        noteStatus("active", "Connected");
+      } else if (state === "disconnected" || state === "failed") {
+        setSyncText("Connection failed. Try making a new code.");
+        noteStatus(
+          "danger",
+          "Connection failed",
+          `WebRTC state changed to ${state}.`,
+        );
+      } else if (state === "closed") {
+        setSyncText("Connection closed.");
+      }
+    };
+
+    peer.connection.oniceconnectionstatechange = () => {
+      pushDevLog(
+        "ready",
+        "ICE state",
+        `ICE connection state: ${peer.connection.iceConnectionState}.`,
+      );
+    };
+
+    peer.connection.onicecandidateerror = () => {
+      pushDevLog(
+        "warning",
+        "ICE error",
+        "A network candidate failed. If this keeps happening, create a fresh code on both phones.",
+      );
+    };
+
     peer.channel.onopen = () => {
-      setSyncText("Peer active. Relay continues in the background.");
+      setSyncText("Connected. Sharing can continue in the background.");
       noteStatus(
         "active",
-        "Peer active",
-        "WebRTC link is open over the local hotspot/LAN.",
+        "Connected",
+        "The phones are linked on the same hotspot.",
       );
 
-      if (activeQrTitle.startsWith("Connection")) {
+      if (activeQrTitle.startsWith("Step")) {
         setActiveQrStatus(formatRelativeTone("active", "Peer connected"));
         setActiveQrDetail(
-          "The peer link is live. You can close this QR and keep relaying in the background.",
+          "The phones are linked. You can close this screen and keep sharing in the background.",
         );
       }
 
@@ -536,10 +552,10 @@ export function NexusApp() {
       setSyncText("Peer disconnected. Ready for the next encounter.");
       noteStatus(
         "warning",
-        "Peer disconnected",
-        "The active link closed. Messages remain stored locally.",
+        "Disconnected",
+        "The link closed. Messages stay on this phone.",
       );
-      if (activeQrTitle.startsWith("Connection")) {
+      if (activeQrTitle.startsWith("Step")) {
         setActiveQrStatus(formatRelativeTone("warning", "Peer disconnected"));
       }
     };
@@ -626,10 +642,10 @@ export function NexusApp() {
     if (wire.type === "SYNC_DONE") {
       setSyncText(
         wire.sentCount > 0
-          ? `Relay active. Sent ${wire.sentCount} top relay message${wire.sentCount === 1 ? "" : "s"}.`
-          : "Relay active. Peer already has the latest relay set.",
+          ? `Connected. Sent ${wire.sentCount} top message${wire.sentCount === 1 ? "" : "s"}.`
+          : "Connected. The other phone already has the latest messages.",
       );
-      if (activeQrTitle.startsWith("Connection")) {
+      if (activeQrTitle.startsWith("Step")) {
         setActiveQrStatus(
           formatRelativeTone(
             "active",
@@ -666,19 +682,19 @@ export function NexusApp() {
       if (decoded.startsWith("W")) {
         if (mode === "answer" && offerPeerRef.current) {
           await finalizeInitiator(offerPeerRef.current.connection, decoded);
-          setSyncText("Answer received. Waiting for the peer link to open.");
-          if (activeQrTitle === "Connection Offer") {
+          setSyncText("Answer scanned. Waiting to connect.");
+          if (activeQrTitle === "Step 1 QR") {
             setActiveQrStatus(
               formatRelativeTone("warning", "Answer received"),
             );
             setActiveQrDetail(
-              "The answer was scanned successfully. Keep this screen open while the peer link finishes connecting.",
+              "The answer was scanned. Keep this screen open while the phones connect.",
             );
           }
           pushDevLog(
             "active",
-            "Handshake finalized",
-            "Initiator applied the scanned answer token.",
+            "Answer scanned",
+            "Phone 1 accepted the answer code.",
           );
           return;
         }
@@ -690,16 +706,16 @@ export function NexusApp() {
           lastAnswerToken: joiner.answerToken,
         }));
         await openQr(
-          "Connection Answer",
-          "Show this answer back to the initiating device to complete the peer link.",
+          "Step 2 QR",
+          "Show this code to Phone 1 to finish connecting.",
           joiner.answerToken,
-          formatRelativeTone("warning", "Awaiting initiator"),
+          formatRelativeTone("warning", "Waiting for Phone 1"),
         );
-        setSyncText("Answer ready. Show it back to the initiating device.");
+        setSyncText("Step 2 ready. Show this code to Phone 1.");
         pushDevLog(
           "active",
-          "Answer token created",
-          "Joiner scanned the offer and generated a WebRTC answer.",
+          "Step 2 ready",
+          "Phone 2 scanned the first code and made the second code.",
         );
         return;
       }
@@ -723,17 +739,17 @@ export function NexusApp() {
     }));
 
     await openQr(
-      "Connection Offer",
-      "Ask the other device to scan this while both devices are on the same hotspot/LAN.",
+      "Step 1 QR",
+      "Ask Phone 2 to scan this while both phones are on the same hotspot.",
       result.offerToken,
-      formatRelativeTone("warning", "Awaiting answer"),
+      formatRelativeTone("warning", "Waiting for Phone 2"),
     );
 
-    setSyncText("Offer ready. The other device should scan this first.");
+    setSyncText("Step 1 ready. Phone 2 should scan this first.");
     pushDevLog(
       "active",
-      "Offer token created",
-      "Initiator prepared a WebRTC offer for the local hotspot/LAN encounter.",
+      "Step 1 ready",
+      "Phone 1 made the first connection code.",
     );
   }
 
@@ -884,8 +900,8 @@ export function NexusApp() {
   }
 
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-md flex-col px-4 py-5 sm:px-6">
-      <section className="relative overflow-hidden rounded-[2rem] border border-white/50 bg-[#f6f2e8]/90 p-5 shadow-[0_24px_80px_rgba(16,32,51,0.14)] backdrop-blur">
+    <main className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-4 py-4 sm:px-6 sm:py-6">
+      <section className="relative mx-auto w-full max-w-3xl overflow-hidden rounded-[2rem] border border-white/50 bg-[#f6f2e8]/90 p-4 shadow-[0_24px_80px_rgba(16,32,51,0.14)] backdrop-blur sm:p-5">
         <div className="absolute inset-x-0 top-0 h-28 bg-[radial-gradient(circle_at_top,rgba(227,86,49,0.18),transparent_65%)]" />
 
         <div className="relative">
@@ -901,7 +917,7 @@ export function NexusApp() {
               <h1 className="mt-2 text-3xl font-semibold text-[#102033]">
                 {section === "relay" && "Relay"}
                 {section === "compose" && "Compose"}
-                {section === "connect" && "Connect"}
+                {section === "connect" && "Nearby"}
               </h1>
             </button>
 
@@ -940,7 +956,7 @@ export function NexusApp() {
 
           {section === "relay" && (
             <section className="mt-6 space-y-4">
-              <div className="grid grid-cols-3 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                 <article className="rounded-[1.4rem] bg-[#102033] p-4 text-white">
                   <p className="text-xs uppercase tracking-[0.22em] text-white/60">
                     Stored
@@ -955,15 +971,15 @@ export function NexusApp() {
                 </article>
                 <article className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4 text-[#102033]">
                   <p className="text-xs uppercase tracking-[0.22em] text-[#945f3d]">
-                    Engine
+                    More
                   </p>
                   <p className="mt-2 text-lg font-semibold">
-                    {topWarmCount} warm / {topColdCount} cold
+                    {topWarmCount} medium / {topColdCount} low
                   </p>
                 </article>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <button
                   type="button"
                   onClick={() => void handleShowSnapshotQr()}
@@ -973,7 +989,7 @@ export function NexusApp() {
                     Share
                   </span>
                   <span className="mt-2 block text-xl font-semibold">
-                    Snapshot QR
+                    Share QR
                   </span>
                 </button>
                 <button
@@ -982,10 +998,10 @@ export function NexusApp() {
                   className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/80 px-4 py-4 text-left text-[#102033]"
                 >
                   <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
-                    Encounter
+                    Nearby
                   </span>
                   <span className="mt-2 block text-xl font-semibold">
-                    Open Connect
+                    Connect
                   </span>
                 </button>
               </div>
@@ -1026,10 +1042,10 @@ export function NexusApp() {
                     <p className="mt-3 text-lg leading-6 font-medium text-[#102033]">
                       {message.payload}
                     </p>
-                    <div className="mt-3 flex items-center gap-3 text-xs text-[#5a6472]">
-                      <span>priority {message.priority}</span>
+                    <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-[#5a6472]">
+                      <span>level {message.priority}</span>
                       <span>{message.temperature}</span>
-                      <span>score {message.score.toFixed(2)}</span>
+                      <span>rank {message.score.toFixed(2)}</span>
                     </div>
                   </button>
                 ))}
@@ -1046,10 +1062,10 @@ export function NexusApp() {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                        Developer
+                        Debug
                       </p>
                       <h2 className="mt-1 text-lg font-semibold text-[#102033]">
-                        Relay Visibility
+                        Connection details
                       </h2>
                     </div>
                     <button
@@ -1063,37 +1079,37 @@ export function NexusApp() {
 
                   {devPanelOpen && (
                     <div className="mt-4 space-y-4 text-sm text-[#102033]">
-                      <div className="grid grid-cols-2 gap-3">
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                         <div className="rounded-[1.2rem] bg-slate-100 px-3 py-3">
                           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">
                             Sync
                           </p>
                           <p className="mt-2">
-                            novel {devState.syncStats.lastNovelCount} / sent{" "}
+                            new {devState.syncStats.lastNovelCount} / sent{" "}
                             {devState.syncStats.lastSentCount} / received{" "}
                             {devState.syncStats.lastReceivedCount}
                           </p>
                         </div>
                         <div className="rounded-[1.2rem] bg-slate-100 px-3 py-3">
                           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">
-                            Quarantine
+                            Held
                           </p>
-                          <p className="mt-2">{devState.quarantineCount} stored</p>
+                          <p className="mt-2">{devState.quarantineCount} saved</p>
                         </div>
                       </div>
 
                       <div className="rounded-[1.2rem] bg-slate-100 px-3 py-3">
                         <p className="text-xs uppercase tracking-[0.18em] text-slate-500">
-                          Raw Payloads
+                          Codes
                         </p>
                         <p className="mt-2 break-all font-mono text-xs">
                           snapshot: {devState.lastSnapshotPayload || "none"}
                         </p>
                         <p className="mt-2 break-all font-mono text-xs">
-                          offer: {devState.lastOfferToken || "none"}
+                          first: {devState.lastOfferToken || "none"}
                         </p>
                         <p className="mt-2 break-all font-mono text-xs">
-                          answer: {devState.lastAnswerToken || "none"}
+                          second: {devState.lastAnswerToken || "none"}
                         </p>
                       </div>
 
@@ -1117,7 +1133,7 @@ export function NexusApp() {
                                 {run.mode}
                               </span>
                               <span className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                                {run.stages.length} components
+                                {run.stages.length} steps
                               </span>
                             </div>
                             <p className="mt-2 text-sm font-medium text-[#102033]">
@@ -1178,11 +1194,10 @@ export function NexusApp() {
                   Compose
                 </p>
                 <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                  Create a relay message
+                  Write a message
                 </h2>
                 <p className="mt-2 text-sm text-[#5a6472]">
-                  Save returns you to Relay with the new message ranked by the
-                  relay engine.
+                  Save keeps this message on your phone.
                 </p>
               </div>
 
@@ -1193,7 +1208,7 @@ export function NexusApp() {
                 </div>
               )}
 
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 {(["text", "alert"] as MessageType[]).map((type) => (
                   <button
                     key={type}
@@ -1237,7 +1252,7 @@ export function NexusApp() {
                 </select>
               </label>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <button
                   type="button"
                   onClick={() => {
@@ -1267,13 +1282,13 @@ export function NexusApp() {
                   Hotspot Flow
                 </p>
                 <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                  WebRTC over local hotspot
+                  Connect phones nearby
                 </h2>
                 <ol className="mt-3 space-y-2 text-sm text-[#5a6472]">
-                  <li>1. One device creates a hotspot named like NEXUS-XXXX.</li>
-                  <li>2. The other device joins that hotspot.</li>
-                  <li>3. Create an offer QR or scan one to join the encounter.</li>
-                  <li>4. Keep relaying while the peer link stays open.</li>
+                  <li>1. Put both phones on the same hotspot.</li>
+                  <li>2. On Phone 1, tap Make First QR.</li>
+                  <li>3. On Phone 2, tap Scan First QR.</li>
+                  <li>4. Show the second QR back to Phone 1.</li>
                 </ol>
               </div>
 
@@ -1283,24 +1298,24 @@ export function NexusApp() {
                 className="w-full rounded-[1.5rem] bg-[#102033] px-4 py-5 text-left text-white"
               >
                 <span className="block text-xs uppercase tracking-[0.22em] text-white/60">
-                  Initiator
+                  Phone 1
                 </span>
                 <span className="mt-2 block text-2xl font-semibold">
-                  Create Offer QR
+                  Make First QR
                 </span>
               </button>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <button
                   type="button"
                   onClick={() => openScanner("offer")}
                   className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left text-[#102033]"
                 >
                   <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
-                    Joiner
+                    Phone 2
                   </span>
                   <span className="mt-2 block text-xl font-semibold">
-                    Scan Offer
+                    Scan First QR
                   </span>
                 </button>
 
@@ -1310,10 +1325,10 @@ export function NexusApp() {
                   className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left text-[#102033]"
                 >
                   <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
-                    Initiator
+                    Phone 1
                   </span>
                   <span className="mt-2 block text-xl font-semibold">
-                    Scan Answer
+                    Scan Second QR
                   </span>
                 </button>
               </div>
@@ -1323,13 +1338,13 @@ export function NexusApp() {
                 onClick={() => openScanner("snapshot")}
                 className="w-full rounded-[1.4rem] border border-dashed border-[#d7cfbe] bg-white px-4 py-4 text-left text-[#102033]"
               >
-                <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
-                  Fallback
-                </span>
-                <span className="mt-2 block text-xl font-semibold">
-                  Scan Snapshot QR
-                </span>
-              </button>
+                  <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
+                    Fallback
+                  </span>
+                  <span className="mt-2 block text-xl font-semibold">
+                    Scan Share QR
+                  </span>
+                </button>
 
               <div className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.22em] text-[#945f3d]">
@@ -1377,7 +1392,7 @@ export function NexusApp() {
               </button>
             </div>
 
-            <div className="mt-4 grid grid-cols-3 gap-2">
+            <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
               <button
                 type="button"
                 onClick={() => setSecuritySection("security")}
@@ -1388,7 +1403,7 @@ export function NexusApp() {
                     : "bg-white text-[#102033]",
                 )}
               >
-                Security
+                Lock
               </button>
               <button
                 type="button"
@@ -1400,21 +1415,19 @@ export function NexusApp() {
                     : "bg-white text-[#102033]",
                 )}
               >
-                Emergency
+                Wipe
               </button>
               <button
                 type="button"
                 onClick={() => setSecuritySection("developer")}
-                disabled={!developerUnlocked}
                 className={classNames(
                   "rounded-[1rem] px-3 py-3 text-sm font-semibold",
-                  !developerUnlocked && "cursor-not-allowed opacity-50",
                   securitySection === "developer"
                     ? "bg-[#102033] text-white"
                     : "bg-white text-[#102033]",
                 )}
               >
-                Developer
+                Debug
               </button>
             </div>
 
@@ -1467,17 +1480,22 @@ export function NexusApp() {
               <div className="mt-4 space-y-3">
                 <button
                   type="button"
-                  onClick={() => setDeveloperMode((current) => !current)}
+                  onClick={() => {
+                    setDeveloperMode((current) => !current);
+                    setDevPanelOpen(true);
+                    setSection("relay");
+                    setSettingsOpen(false);
+                  }}
                   className="w-full rounded-[1.2rem] bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
                 >
-                  {developerMode ? "Disable Dev Panel" : "Enable Dev Panel"}
+                  {developerMode ? "Hide Debug Panel" : "Show Debug Panel"}
                 </button>
                 <button
                   type="button"
                   onClick={() => void handleManualQuarantineDemo()}
                   className="w-full rounded-[1.2rem] bg-white px-4 py-3 text-sm font-semibold text-[#102033]"
                 >
-                  Run Quarantine Demo
+                  Test Held Message
                 </button>
               </div>
             )}
@@ -1489,16 +1507,16 @@ export function NexusApp() {
 
       {scannerMode && (
         <div className="fixed inset-0 z-50 bg-[#08111c] px-4 py-6 text-white">
-          <div className="mx-auto flex h-full max-w-md flex-col">
+          <div className="mx-auto flex h-full w-full max-w-2xl flex-col">
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-xs uppercase tracking-[0.24em] text-white/60">
                   Camera
                 </p>
                 <h2 className="mt-2 text-2xl font-semibold">
-                  {scannerMode === "snapshot" && "Scan Snapshot QR"}
-                  {scannerMode === "offer" && "Scan Offer QR"}
-                  {scannerMode === "answer" && "Scan Answer QR"}
+                  {scannerMode === "snapshot" && "Scan Share QR"}
+                  {scannerMode === "offer" && "Scan First QR"}
+                  {scannerMode === "answer" && "Scan Second QR"}
                 </h2>
               </div>
               <button
@@ -1525,7 +1543,7 @@ export function NexusApp() {
 
       {activeQrUrl && (
         <div className="fixed inset-0 z-50 bg-[#f6f2e8] px-4 py-6">
-          <div className="mx-auto flex h-full max-w-md flex-col items-center justify-center">
+          <div className="mx-auto flex h-full w-full max-w-2xl flex-col items-center justify-center">
             <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#945f3d]">
               Nexus Relay
             </p>
@@ -1598,13 +1616,13 @@ export function NexusApp() {
 
             <div className="mt-5 grid grid-cols-2 gap-3 text-sm text-[#425061]">
               <div className="rounded-[1.2rem] bg-white px-4 py-3">
-                <p>priority {selectedMessage.priority}</p>
-                <p className="mt-1">score {selectedMessage.score.toFixed(2)}</p>
+                <p>level {selectedMessage.priority}</p>
+                <p className="mt-1">rank {selectedMessage.score.toFixed(2)}</p>
               </div>
               <div className="rounded-[1.2rem] bg-white px-4 py-3">
                 <p>{selectedMessage.temperature}</p>
                 <p className="mt-1">
-                  display confidence {selectedMessage.merge_confidence.toFixed(2)}
+                  compare {selectedMessage.merge_confidence.toFixed(2)}
                 </p>
               </div>
             </div>
@@ -1612,13 +1630,13 @@ export function NexusApp() {
             {(selectedMessage.is_conflicted || selectedMessage.is_superseded) && (
               <div className="mt-4 rounded-[1.2rem] bg-amber-100 px-4 py-3 text-sm text-amber-900">
                 {selectedMessage.is_conflicted &&
-                  `This message has related versions or conflicts: ${selectedMessage.conflict_ids.join(", ")}.`}
+                  `This message has other versions: ${selectedMessage.conflict_ids.join(", ")}.`}
                 {selectedMessage.is_superseded &&
-                  " This record has been superseded by a newer local variant."}
+                  " This message was replaced by a newer version."}
               </div>
             )}
 
-            <div className="mt-6 grid grid-cols-2 gap-3">
+            <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <button
                 type="button"
                 onClick={() => {
@@ -1627,14 +1645,14 @@ export function NexusApp() {
                 }}
                 className="rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]"
               >
-                Share Snapshot
+                Share QR
               </button>
               <button
                 type="button"
                 onClick={() => beginCompose(selectedMessage)}
                 className="rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white"
               >
-                Create Update
+                Edit as New
               </button>
             </div>
           </section>
