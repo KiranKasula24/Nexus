@@ -20,8 +20,11 @@ export interface NexusMessage {
 export interface NexusComputedFields {
   temperature: Temperature;
   score: number;
+  merge_confidence: number;
   is_expired: boolean;
   is_superseded: boolean;
+  is_conflicted: boolean;
+  conflict_ids: string[];
 }
 
 export type NexusMessageWithComputed = NexusMessage & NexusComputedFields;

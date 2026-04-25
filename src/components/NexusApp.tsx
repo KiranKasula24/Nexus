@@ -1,67 +1,95 @@
 "use client";
 
 import Image from "next/image";
-import Link from "next/link";
 import QRCode from "qrcode";
-import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  BloomFilter,
-  broadcastMessage,
-  buildSnapshot,
+  buildBloomFromMessages,
   createInitiator,
   createJoiner,
-  createMessage,
-  decodeTransportPayload,
   finalizeInitiator,
-  ingestMessage,
   loadPinHash,
   monitorTripleShake,
   NexusRepository,
+  QUARANTINE_KEY,
   requestMotionPermissionIfNeeded,
+  runComposePipeline,
   runLevel3Wipe,
+  runPeerReceivePipeline,
+  runPeerSendSelectionPipeline,
   runScoringLoop,
+  runSnapshotIngressPipeline,
+  runSnapshotSharePipeline,
   savePinHash,
   SCORING_INTERVAL_MS,
-  selectMessagesNotInBloom,
   startCameraScanner,
   submitPinAttempt,
+  type MessageType,
   type NexusMessage,
   type NexusMessageWithComputed,
   type PeerArtifacts,
+  type PipelineRun,
 } from "@/lib/nexus";
 
-type Screen = "home" | "send" | "receive" | "messages";
+type Section = "relay" | "compose" | "connect";
 type ScannerMode = "snapshot" | "offer" | "answer";
-type ComposeType = "text" | "alert" | "audio";
-
+type StatusTone = "ready" | "active" | "warning" | "danger";
 type SyncWire =
-  | { type: "BLOOM_OFFER"; bloom: string }
+  | { type: "BLOOM_OFFER"; bloom: string; messageCount: number }
   | { type: "MSG_PUSH"; message: NexusMessage }
   | { type: "SYNC_DONE"; sentCount: number };
+
+interface DevLogEntry {
+  id: string;
+  tone: StatusTone;
+  title: string;
+  detail: string;
+}
+
+interface SyncStats {
+  lastNovelCount: number;
+  lastSentCount: number;
+  lastReceivedCount: number;
+}
+
+interface DevState {
+  logs: DevLogEntry[];
+  runs: PipelineRun[];
+  lastSnapshotPayload: string;
+  lastOfferToken: string;
+  lastAnswerToken: string;
+  quarantineCount: number;
+  syncStats: SyncStats;
+}
 
 function classNames(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(" ");
 }
 
+function toneClasses(tone: StatusTone): string {
+  if (tone === "active") return "bg-emerald-100 text-emerald-900";
+  if (tone === "warning") return "bg-amber-100 text-amber-900";
+  if (tone === "danger") return "bg-rose-100 text-rose-900";
+  return "bg-slate-100 text-slate-800";
+}
+
 function temperatureDot(temperature: NexusMessageWithComputed["temperature"]): string {
-  if (temperature === "hot") return "bg-red-500";
+  if (temperature === "hot") return "bg-rose-500";
   if (temperature === "warm") return "bg-amber-400";
   return "bg-slate-400";
 }
 
-function messageLabel(type: ComposeType): string {
+function messageLabel(type: MessageType): string {
   if (type === "alert") return "Alert";
   if (type === "audio") return "Audio";
   return "Text";
 }
 
-function summarizeHot(messages: NexusMessageWithComputed[]): string {
-  const hot = messages.filter((message) => message.temperature === "hot").length;
-  const warm = messages.filter((message) => message.temperature === "warm").length;
-
-  if (hot > 0) return `${hot} hot`;
-  if (warm > 0) return `${warm} warm`;
-  return "all cold";
+function formatRelativeTone(
+  tone: StatusTone,
+  label: string,
+): { tone: StatusTone; label: string } {
+  return { tone, label };
 }
 
 async function buildQrDataUrl(value: string): Promise<string> {
@@ -76,6 +104,22 @@ async function buildQrDataUrl(value: string): Promise<string> {
   });
 }
 
+function initialDevState(): DevState {
+  return {
+    logs: [],
+    runs: [],
+    lastSnapshotPayload: "",
+    lastOfferToken: "",
+    lastAnswerToken: "",
+    quarantineCount: 0,
+    syncStats: {
+      lastNovelCount: 0,
+      lastSentCount: 0,
+      lastReceivedCount: 0,
+    },
+  };
+}
+
 export function NexusApp() {
   const repositoryRef = useRef<NexusRepository | null>(null);
   const syncChannelRef = useRef<RTCDataChannel | null>(null);
@@ -83,21 +127,34 @@ export function NexusApp() {
   const scannerStopRef = useRef<(() => void) | null>(null);
   const shakeStopRef = useRef<(() => void) | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const answerPeerRef = useRef<PeerArtifacts | null>(null);
   const offerPeerRef = useRef<PeerArtifacts | null>(null);
+  const joinerPeerRef = useRef<PeerArtifacts | null>(null);
+  const handleSyncWireRef = useRef<
+    ((raw: string) => Promise<void>) | null
+  >(null);
+  const handleScannedPayloadRef = useRef<
+    ((decoded: string, mode: ScannerMode) => Promise<void>) | null
+  >(null);
 
   const [messages, setMessages] = useState<NexusMessageWithComputed[]>([]);
-  const [screen, setScreen] = useState<Screen>("home");
-  const [status, setStatus] = useState("Ready");
-  const [syncStatus, setSyncStatus] = useState("No active device link");
-  const [scannerStatus, setScannerStatus] = useState("Scanner idle");
-
-  const [composeOpen, setComposeOpen] = useState(false);
+  const [section, setSection] = useState<Section>("relay");
+  const [selectedMessage, setSelectedMessage] =
+    useState<NexusMessageWithComputed | null>(null);
   const [draftText, setDraftText] = useState("");
   const [draftPriority, setDraftPriority] = useState<1 | 2 | 3 | 4 | 5>(4);
-  const [draftType, setDraftType] = useState<ComposeType>("text");
+  const [draftType, setDraftType] = useState<MessageType>("text");
+  const [draftSupersedes, setDraftSupersedes] = useState<string | undefined>();
+
+  const [statusTone, setStatusTone] = useState<StatusTone>("ready");
+  const [statusText, setStatusText] = useState("Ready to relay");
+  const [syncText, setSyncText] = useState("Join the same hotspot, then connect");
+  const [scannerStatus, setScannerStatus] = useState("Scanner idle");
+  const [storageWarning, setStorageWarning] = useState("");
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [securitySection, setSecuritySection] = useState<
+    "security" | "emergency" | "developer"
+  >("security");
   const [pinSetup, setPinSetup] = useState("123456");
   const [pinAttempt, setPinAttempt] = useState("123456");
   const [pinHash, setPinHash] = useState("");
@@ -105,78 +162,126 @@ export function NexusApp() {
   const [sentinelStatus, setSentinelStatus] = useState("Sentinel idle");
   const [shakeArmed, setShakeArmed] = useState(false);
 
-  const [offerToken, setOfferToken] = useState("");
-  const [activeQrLabel, setActiveQrLabel] = useState("");
-  const [activeQrUrl, setActiveQrUrl] = useState("");
+  const [titleTapCount, setTitleTapCount] = useState(0);
+  const [developerUnlocked, setDeveloperUnlocked] = useState(false);
+  const [developerMode, setDeveloperMode] = useState(false);
+  const [devPanelOpen, setDevPanelOpen] = useState(false);
+  const [devState, setDevState] = useState<DevState>(initialDevState);
 
   const [scannerMode, setScannerMode] = useState<ScannerMode | null>(null);
-  const [selectedMessage, setSelectedMessage] =
-    useState<NexusMessageWithComputed | null>(null);
+  const [activeQrUrl, setActiveQrUrl] = useState("");
+  const [activeQrTitle, setActiveQrTitle] = useState("");
+  const [activeQrDetail, setActiveQrDetail] = useState("");
+  const [activeQrStatus, setActiveQrStatus] =
+    useState<{ tone: StatusTone; label: string } | null>(null);
 
-  const totalHot = useMemo(
+  const topHotCount = useMemo(
     () => messages.filter((message) => message.temperature === "hot").length,
     [messages],
   );
-  const temperatureSummary = useMemo(() => summarizeHot(messages), [messages]);
-  const topMessage = messages[0];
-
-  const handleScannedPayload = useEffectEvent(
-    async (decoded: string, mode: ScannerMode): Promise<void> => {
-      if (!repositoryRef.current) return;
-
-      try {
-        const result = decodeTransportPayload(decoded);
-
-        if (result.kind === "snapshot") {
-          let stored = 0;
-          for (const message of result.messages) {
-            const ingestResult = await ingestMessage(message, repositoryRef.current);
-            if (ingestResult.status === "stored") {
-              stored += 1;
-            }
-          }
-          await refreshMessages();
-          setStatus(`Imported ${stored} new message${stored === 1 ? "" : "s"} from QR`);
-          return;
-        }
-
-        if (result.kind === "webrtc") {
-          if (mode === "answer" && offerPeerRef.current) {
-            await finalizeInitiator(offerPeerRef.current.connection, decoded);
-            setSyncStatus("Answer received. Waiting for link to open");
-            setStatus("Connection finalized");
-            return;
-          }
-
-          const joiner = await createJoiner(decoded);
-          await attachPeer(joiner.peer, "joiner");
-          setActiveQrLabel("Connection answer");
-          setActiveQrUrl(await buildQrDataUrl(joiner.answerToken));
-          setSyncStatus("Answer ready. Show this QR back to the sender");
-          return;
-        }
-
-        setStatus(`Legacy payload received: ${result.url}`);
-      } catch (error) {
-        setStatus(error instanceof Error ? error.message : "Could not decode QR");
-      }
-    },
+  const topWarmCount = useMemo(
+    () => messages.filter((message) => message.temperature === "warm").length,
+    [messages],
   );
+  const topColdCount = useMemo(
+    () => messages.filter((message) => message.temperature === "cold").length,
+    [messages],
+  );
+
+  function pushDevLog(tone: StatusTone, title: string, detail: string): void {
+    setDevState((current) => ({
+      ...current,
+      logs: [
+        {
+          id: `${Date.now()}-${current.logs.length}`,
+          tone,
+          title,
+          detail,
+        },
+        ...current.logs,
+      ].slice(0, 18),
+    }));
+  }
+
+  function recordPipelineRun(run: PipelineRun): void {
+    setDevState((current) => ({
+      ...current,
+      runs: [run, ...current.runs].slice(0, 8),
+    }));
+
+    for (const event of run.events) {
+      pushDevLog(
+        event.status === "error"
+          ? "danger"
+          : event.status === "warning"
+            ? "warning"
+            : "active",
+        `${event.component} ${event.status}`,
+        event.detail,
+      );
+    }
+  }
+
+  async function refreshQuarantineCount(): Promise<void> {
+    if (!repositoryRef.current) return;
+    const quarantine =
+      (await repositoryRef.current.getSystemState<Partial<NexusMessage>[]>(
+        QUARANTINE_KEY,
+      )) ?? [];
+    setDevState((current) => ({
+      ...current,
+      quarantineCount: quarantine.length,
+    }));
+  }
+
+  async function refreshMessages(): Promise<void> {
+    if (!repositoryRef.current) return;
+    setMessages(await repositoryRef.current.getAll());
+    await refreshQuarantineCount();
+  }
+
+  function noteStatus(
+    tone: StatusTone,
+    label: string,
+    detail?: string,
+  ): void {
+    setStatusTone(tone);
+    setStatusText(label);
+    if (detail) {
+      pushDevLog(tone, label, detail);
+    }
+  }
 
   useEffect(() => {
     const repository = new NexusRepository();
     repositoryRef.current = repository;
 
-    const refresh = async (): Promise<void> => {
+    const hydrate = async (): Promise<void> => {
       setMessages(await repository.getAll());
+
       const storedPinHash = await loadPinHash(repository);
       if (storedPinHash) {
         setPinHash(storedPinHash);
         setPinLocked(true);
       }
+
+      if (await repository.isUsingMemoryStorage()) {
+        setStorageWarning(
+          "IndexedDB is unavailable. Running in temporary in-memory mode.",
+        );
+        setStatusTone("warning");
+        setStatusText("Temporary storage only");
+        pushDevLog(
+          "warning",
+          "Temporary storage only",
+          "IndexedDB unavailable, message storage falls back to memory for this session.",
+        );
+      }
+
+      await refreshQuarantineCount();
     };
 
-    void refresh();
+    void hydrate();
     const stopScoring = runScoringLoop(repository, SCORING_INTERVAL_MS);
     const stopSweep = repository.startExpirySweep();
 
@@ -191,8 +296,8 @@ export function NexusApp() {
       syncChannelRef.current?.close();
       offerPeerRef.current?.channel.close();
       offerPeerRef.current?.connection.close();
-      answerPeerRef.current?.channel.close();
-      answerPeerRef.current?.connection.close();
+      joinerPeerRef.current?.channel.close();
+      joinerPeerRef.current?.connection.close();
     };
   }, []);
 
@@ -200,15 +305,15 @@ export function NexusApp() {
     if (!scannerMode || !videoRef.current) return undefined;
 
     let active = true;
+    const mode = scannerMode;
     setScannerStatus("Opening camera");
 
-      const mode = scannerMode;
-      void startCameraScanner(videoRef.current, (decoded) => {
-        if (!active) return;
-        setScannerMode(null);
-        setScannerStatus("QR captured");
-        void handleScannedPayload(decoded, mode);
-      })
+    void startCameraScanner(videoRef.current, (decoded) => {
+      if (!active) return;
+      setScannerMode(null);
+      setScannerStatus("QR captured");
+      void handleScannedPayloadRef.current?.(decoded, mode);
+    })
       .then((stop) => {
         if (!active) {
           stop();
@@ -231,66 +336,164 @@ export function NexusApp() {
     };
   }, [scannerMode]);
 
-  async function refreshMessages(): Promise<void> {
-    if (!repositoryRef.current) return;
-    setMessages(await repositoryRef.current.getAll());
+  async function openQr(
+    title: string,
+    detail: string,
+    payload: string,
+    status: { tone: StatusTone; label: string } | null,
+  ): Promise<void> {
+    setActiveQrTitle(title);
+    setActiveQrDetail(detail);
+    setActiveQrStatus(status);
+    setActiveQrUrl(await buildQrDataUrl(payload));
   }
 
   function closeQr(): void {
-    setActiveQrLabel("");
+    setActiveQrTitle("");
+    setActiveQrDetail("");
+    setActiveQrStatus(null);
     setActiveQrUrl("");
+  }
+
+  function queueDeveloperUnlock(): void {
+    setTitleTapCount((current) => {
+      const next = current + 1;
+      if (next >= 6) {
+        setDeveloperUnlocked(true);
+        setSettingsOpen(true);
+        setSecuritySection("developer");
+        pushDevLog(
+          "active",
+          "Developer mode unlocked",
+          "Hidden developer controls are now available in Settings.",
+        );
+        return 0;
+      }
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    if (titleTapCount === 0) return undefined;
+    const timer = window.setTimeout(() => setTitleTapCount(0), 1400);
+    return () => window.clearTimeout(timer);
+  }, [titleTapCount]);
+
+  function beginCompose(message?: NexusMessageWithComputed): void {
+    if (message) {
+      setDraftText(message.payload);
+      setDraftPriority(message.priority);
+      setDraftType(message.type);
+      setDraftSupersedes(message.id);
+      setSelectedMessage(null);
+      noteStatus(
+        "warning",
+        "Composing update",
+        `Preparing a new message that supersedes ${message.id}.`,
+      );
+    } else {
+      setDraftText("");
+      setDraftPriority(4);
+      setDraftType("text");
+      setDraftSupersedes(undefined);
+    }
+    setSection("compose");
   }
 
   async function handleSaveDraft(): Promise<void> {
     if (!repositoryRef.current || !draftText.trim()) {
-      setStatus("Write a message before saving");
+      noteStatus("warning", "Message is empty");
       return;
     }
 
-    const message = await createMessage({
+    const result = await runComposePipeline(repositoryRef.current, {
       type: draftType,
       priority: draftPriority,
       payload: draftText.trim(),
+      supersedes: draftSupersedes,
     });
 
-    await repositoryRef.current.put(message);
+    recordPipelineRun(result.run);
     await refreshMessages();
-    setComposeOpen(false);
+
+    noteStatus(
+      result.message ? "active" : "warning",
+      result.message ? "Message stored on this device" : "Duplicate message skipped",
+      result.run.summary,
+    );
+
     setDraftText("");
-    setStatus("Message stored on this device");
-    setScreen("send");
+    setDraftSupersedes(undefined);
+    setSection("relay");
   }
 
-  async function handleSnapshotShare(): Promise<void> {
+  async function handleShowSnapshotQr(): Promise<void> {
     if (messages.length === 0) {
-      setStatus("Create a message first");
+      noteStatus("warning", "No stored messages to share");
       return;
     }
 
     try {
-      const result = buildSnapshot(messages);
-      setActiveQrLabel(`Snapshot QR - ${result.count} message${result.count === 1 ? "" : "s"}`);
-      setActiveQrUrl(await buildQrDataUrl(result.qr));
-      setStatus(`Sharing top ${result.count} message${result.count === 1 ? "" : "s"} by QR`);
+      if (!repositoryRef.current) return;
+      const result = await runSnapshotSharePipeline(repositoryRef.current);
+      recordPipelineRun(result.run);
+      const snapshot = result.snapshot;
+      if (!snapshot) {
+        noteStatus("danger", "Snapshot build failed", result.run.summary);
+        return;
+      }
+      setDevState((current) => ({
+        ...current,
+        lastSnapshotPayload: snapshot.qr,
+      }));
+      await openQr(
+        "Snapshot QR",
+        "Share the relay engine's highest-ranked snapshot with another device.",
+        snapshot.qr,
+        formatRelativeTone(
+          "ready",
+          `Packed ${snapshot.count} message${snapshot.count === 1 ? "" : "s"}`,
+        ),
+      );
+      noteStatus(
+        "active",
+        "Snapshot ready",
+        result.run.summary,
+      );
     } catch (error) {
-      setStatus(
-        error instanceof Error ? error.message : "Failed to build snapshot",
+      noteStatus(
+        "danger",
+        error instanceof Error ? error.message : "Snapshot build failed",
       );
     }
   }
 
-  async function handleBroadcastTopMessage(): Promise<void> {
-    if (!topMessage) {
-      setStatus("No stored messages to broadcast");
-      return;
-    }
+  async function sendBloomOffer(channel: RTCDataChannel): Promise<void> {
+    if (!repositoryRef.current || channel.readyState !== "open") return;
 
-    try {
-      await broadcastMessage(topMessage);
-      setStatus("Broadcast finished");
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Broadcast failed");
-    }
+    const local = await repositoryRef.current.getAllRaw();
+    const bloom = buildBloomFromMessages(local);
+
+    channel.send(
+      JSON.stringify({
+        type: "BLOOM_OFFER",
+        bloom: bloom.toBase64(),
+        messageCount: local.length,
+      } satisfies SyncWire),
+    );
+
+    setDevState((current) => ({
+      ...current,
+      syncStats: {
+        ...current.syncStats,
+        lastNovelCount: 0,
+      },
+    }));
+    pushDevLog(
+      "active",
+      "Bloom filter exchanged",
+      `Advertised ${local.length} known message IDs to the connected peer.`,
+    );
   }
 
   async function attachPeer(
@@ -300,7 +503,20 @@ export function NexusApp() {
     syncChannelRef.current = peer.channel;
 
     peer.channel.onopen = () => {
-      setSyncStatus("Peer link active. Background sync running");
+      setSyncText("Peer active. Relay continues in the background.");
+      noteStatus(
+        "active",
+        "Peer active",
+        "WebRTC link is open over the local hotspot/LAN.",
+      );
+
+      if (activeQrTitle.startsWith("Connection")) {
+        setActiveQrStatus(formatRelativeTone("active", "Peer connected"));
+        setActiveQrDetail(
+          "The peer link is live. You can close this QR and keep relaying in the background.",
+        );
+      }
+
       void sendBloomOffer(peer.channel);
 
       if (syncTimerRef.current) {
@@ -317,11 +533,19 @@ export function NexusApp() {
         window.clearInterval(syncTimerRef.current);
         syncTimerRef.current = null;
       }
-      setSyncStatus("Peer link closed");
+      setSyncText("Peer disconnected. Ready for the next encounter.");
+      noteStatus(
+        "warning",
+        "Peer disconnected",
+        "The active link closed. Messages remain stored locally.",
+      );
+      if (activeQrTitle.startsWith("Connection")) {
+        setActiveQrStatus(formatRelativeTone("warning", "Peer disconnected"));
+      }
     };
 
     peer.channel.onmessage = (event) => {
-      void handleSyncWire(event.data);
+      void handleSyncWireRef.current?.(event.data);
     };
 
     if (role === "initiator") {
@@ -329,27 +553,10 @@ export function NexusApp() {
       offerPeerRef.current?.connection.close();
       offerPeerRef.current = peer;
     } else {
-      answerPeerRef.current?.channel.close();
-      answerPeerRef.current?.connection.close();
-      answerPeerRef.current = peer;
+      joinerPeerRef.current?.channel.close();
+      joinerPeerRef.current?.connection.close();
+      joinerPeerRef.current = peer;
     }
-  }
-
-  async function sendBloomOffer(channel: RTCDataChannel): Promise<void> {
-    if (!repositoryRef.current || channel.readyState !== "open") return;
-
-    const local = await repositoryRef.current.getAllRaw();
-    const bloom = new BloomFilter();
-    for (const message of local) {
-      bloom.add(message.id);
-    }
-
-    channel.send(
-      JSON.stringify({
-        type: "BLOOM_OFFER",
-        bloom: bloom.toBase64(),
-      } satisfies SyncWire),
-    );
   }
 
   async function handleSyncWire(raw: string): Promise<void> {
@@ -363,11 +570,21 @@ export function NexusApp() {
     }
 
     if (wire.type === "BLOOM_OFFER") {
-      const local = await repositoryRef.current.getAllRaw();
-      const queue = selectMessagesNotInBloom(
-        local,
-        BloomFilter.fromBase64(wire.bloom),
+      const result = await runPeerSendSelectionPipeline(
+        repositoryRef.current,
+        wire.bloom,
       );
+      const queue = result.messages;
+      recordPipelineRun(result.run);
+
+      setDevState((current) => ({
+        ...current,
+        syncStats: {
+          ...current.syncStats,
+          lastNovelCount: queue.length,
+          lastSentCount: queue.length,
+        },
+      }));
 
       for (const message of queue) {
         syncChannelRef.current?.send(
@@ -385,19 +602,113 @@ export function NexusApp() {
     }
 
     if (wire.type === "MSG_PUSH") {
-      const result = await ingestMessage(wire.message, repositoryRef.current);
-      if (result.status === "stored") {
+      const result = await runPeerReceivePipeline(
+        repositoryRef.current,
+        wire.message,
+      );
+      recordPipelineRun(result.run);
+
+      if (result.result === "stored") {
         await refreshMessages();
-        setSyncStatus("Peer link active. New messages received");
+        setDevState((current) => ({
+          ...current,
+          syncStats: {
+            ...current.syncStats,
+            lastReceivedCount: current.syncStats.lastReceivedCount + 1,
+          },
+        }));
+      } else if (result.result === "quarantined") {
+        await refreshQuarantineCount();
       }
       return;
     }
 
     if (wire.type === "SYNC_DONE") {
-      setSyncStatus(
+      setSyncText(
         wire.sentCount > 0
-          ? `Peer link active. Synced ${wire.sentCount} prioritized message${wire.sentCount === 1 ? "" : "s"}`
-          : "Peer link active. Inventories already aligned",
+          ? `Relay active. Sent ${wire.sentCount} top relay message${wire.sentCount === 1 ? "" : "s"}.`
+          : "Relay active. Peer already has the latest relay set.",
+      );
+      if (activeQrTitle.startsWith("Connection")) {
+        setActiveQrStatus(
+          formatRelativeTone(
+            "active",
+            wire.sentCount > 0 ? "Sync complete" : "Already aligned",
+          ),
+        );
+      }
+    }
+  }
+
+  async function handleScannedPayload(
+    decoded: string,
+    mode: ScannerMode,
+  ): Promise<void> {
+    if (!repositoryRef.current) return;
+
+    try {
+      if (decoded.startsWith("S")) {
+        const result = await runSnapshotIngressPipeline(
+          repositoryRef.current,
+          decoded,
+        );
+        recordPipelineRun(result.run);
+        await refreshMessages();
+        noteStatus(
+          result.stored > 0 ? "active" : "warning",
+          `Imported ${result.stored} message${result.stored === 1 ? "" : "s"}`,
+          result.run.summary,
+        );
+        setSection("relay");
+        return;
+      }
+
+      if (decoded.startsWith("W")) {
+        if (mode === "answer" && offerPeerRef.current) {
+          await finalizeInitiator(offerPeerRef.current.connection, decoded);
+          setSyncText("Answer received. Waiting for the peer link to open.");
+          if (activeQrTitle === "Connection Offer") {
+            setActiveQrStatus(
+              formatRelativeTone("warning", "Answer received"),
+            );
+            setActiveQrDetail(
+              "The answer was scanned successfully. Keep this screen open while the peer link finishes connecting.",
+            );
+          }
+          pushDevLog(
+            "active",
+            "Handshake finalized",
+            "Initiator applied the scanned answer token.",
+          );
+          return;
+        }
+
+        const joiner = await createJoiner(decoded);
+        await attachPeer(joiner.peer, "joiner");
+        setDevState((current) => ({
+          ...current,
+          lastAnswerToken: joiner.answerToken,
+        }));
+        await openQr(
+          "Connection Answer",
+          "Show this answer back to the initiating device to complete the peer link.",
+          joiner.answerToken,
+          formatRelativeTone("warning", "Awaiting initiator"),
+        );
+        setSyncText("Answer ready. Show it back to the initiating device.");
+        pushDevLog(
+          "active",
+          "Answer token created",
+          "Joiner scanned the offer and generated a WebRTC answer.",
+        );
+        return;
+      }
+
+      noteStatus("warning", "Unsupported QR payload kind");
+    } catch (error) {
+      noteStatus(
+        "danger",
+        error instanceof Error ? error.message : "Could not decode QR",
       );
     }
   }
@@ -405,10 +716,25 @@ export function NexusApp() {
   async function handleCreateOffer(): Promise<void> {
     const result = await createInitiator();
     await attachPeer(result.peer, "initiator");
-    setOfferToken(result.offerToken);
-    setActiveQrLabel("Connection offer");
-    setActiveQrUrl(await buildQrDataUrl(result.offerToken));
-    setSyncStatus("Offer ready. Scan it from the receiving device");
+
+    setDevState((current) => ({
+      ...current,
+      lastOfferToken: result.offerToken,
+    }));
+
+    await openQr(
+      "Connection Offer",
+      "Ask the other device to scan this while both devices are on the same hotspot/LAN.",
+      result.offerToken,
+      formatRelativeTone("warning", "Awaiting answer"),
+    );
+
+    setSyncText("Offer ready. The other device should scan this first.");
+    pushDevLog(
+      "active",
+      "Offer token created",
+      "Initiator prepared a WebRTC offer for the local hotspot/LAN encounter.",
+    );
   }
 
   async function handleSavePin(): Promise<void> {
@@ -418,37 +744,50 @@ export function NexusApp() {
       const hash = await savePinHash(repositoryRef.current, pinSetup);
       setPinHash(hash);
       setSentinelStatus("PIN saved");
+      noteStatus("ready", "PIN updated");
     } catch (error) {
-      setSentinelStatus(error instanceof Error ? error.message : "Failed to save PIN");
+      setSentinelStatus(
+        error instanceof Error ? error.message : "Failed to save PIN",
+      );
     }
   }
 
   async function handleSubmitPin(): Promise<void> {
     if (!repositoryRef.current || !pinHash) return;
 
-    const result = await submitPinAttempt(repositoryRef.current, pinAttempt, pinHash);
+    const result = await submitPinAttempt(
+      repositoryRef.current,
+      pinAttempt,
+      pinHash,
+    );
 
     if (result.ok) {
       setPinLocked(false);
       setSentinelStatus("Unlocked");
+      noteStatus("ready", "Device unlocked");
       return;
     }
 
     if (result.wiped) {
-      await refreshMessages();
       setPinLocked(false);
-      setSentinelStatus(`Level 2 wipe deleted ${result.deleted} message(s)`);
+      setSentinelStatus(`Selective wipe deleted ${result.deleted} message(s)`);
+      await refreshMessages();
+      noteStatus(
+        "danger",
+        "Selective wipe completed",
+        `Deleted ${result.deleted} high-risk message records after PIN failures.`,
+      );
       return;
     }
 
-    setSentinelStatus(`Wrong PIN. ${result.attemptsLeft} attempt(s) left`);
+    setSentinelStatus(`Wrong PIN. ${result.attemptsLeft} attempt(s) left.`);
   }
 
   async function handleEmergencyWipe(): Promise<void> {
     if (!repositoryRef.current) return;
     const elapsed = await runLevel3Wipe(repositoryRef.current);
     setSentinelStatus(`Device wiped in ${elapsed.toFixed(1)} ms`);
-    setStatus("Local device cleared");
+    noteStatus("danger", "Device wiped", "Emergency wipe completed.");
     window.setTimeout(() => window.location.reload(), 120);
   }
 
@@ -474,21 +813,48 @@ export function NexusApp() {
     setSentinelStatus("Triple-shake wipe armed");
   }
 
+  async function handleManualQuarantineDemo(): Promise<void> {
+    if (!repositoryRef.current) return;
+
+    const invalid = {
+      id: "legacy-v2",
+      type: "text",
+      priority: 3,
+      ttl: Date.now(),
+      created_at: Date.now(),
+      hop_count: 0,
+      weight: 1,
+      payload: "Unsupported schema payload",
+      confidence: "high",
+      schema_version: 2,
+    } as unknown as Partial<NexusMessage>;
+
+    const result = await runPeerReceivePipeline(repositoryRef.current, invalid);
+    recordPipelineRun(result.run);
+    await refreshQuarantineCount();
+  }
+
   function openScanner(mode: ScannerMode): void {
     setScannerMode(mode);
-    setScreen("receive");
   }
+
+  useEffect(() => {
+    handleSyncWireRef.current = handleSyncWire;
+    handleScannedPayloadRef.current = handleScannedPayload;
+  });
 
   if (pinLocked) {
     return (
       <main className="flex min-h-screen items-center justify-center px-4 py-8">
-        <section className="w-full max-w-sm rounded-[2rem] border border-sand-200 bg-[#f8f4eb] p-6 shadow-[0_20px_80px_rgba(16,32,51,0.12)]">
+        <section className="w-full max-w-sm rounded-[2rem] border border-[#ddd1be] bg-[#f8f4eb] p-6 shadow-[0_20px_80px_rgba(16,32,51,0.12)]">
           <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#945f3d]">
-            Sentinel Lock
+            Security Lock
           </p>
-          <h1 className="mt-3 text-3xl font-semibold text-[#102033]">Enter PIN</h1>
+          <h1 className="mt-3 text-3xl font-semibold text-[#102033]">
+            Enter PIN
+          </h1>
           <p className="mt-2 text-sm text-[#5a6472]">
-            Three wrong attempts trigger the selective wipe.
+            Three failed attempts trigger a selective wipe.
           </p>
           <input
             value={pinAttempt}
@@ -521,252 +887,471 @@ export function NexusApp() {
     <main className="mx-auto flex min-h-screen w-full max-w-md flex-col px-4 py-5 sm:px-6">
       <section className="relative overflow-hidden rounded-[2rem] border border-white/50 bg-[#f6f2e8]/90 p-5 shadow-[0_24px_80px_rgba(16,32,51,0.14)] backdrop-blur">
         <div className="absolute inset-x-0 top-0 h-28 bg-[radial-gradient(circle_at_top,rgba(227,86,49,0.18),transparent_65%)]" />
+
         <div className="relative">
-          <div className="flex items-start justify-between">
-            <div>
+          <div className="flex items-start justify-between gap-3">
+            <button
+              type="button"
+              onClick={queueDeveloperUnlock}
+              className="text-left"
+            >
               <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#945f3d]">
                 Nexus Relay
               </p>
               <h1 className="mt-2 text-3xl font-semibold text-[#102033]">
-                {screen === "home" && "Home"}
-                {screen === "send" && "Send"}
-                {screen === "receive" && "Receive"}
-                {screen === "messages" && "Messages"}
+                {section === "relay" && "Relay"}
+                {section === "compose" && "Compose"}
+                {section === "connect" && "Connect"}
               </h1>
-            </div>
+            </button>
+
             <button
               type="button"
               onClick={() => setSettingsOpen(true)}
-              className="rounded-2xl border border-[#d7cfbe] bg-white/70 px-3 py-2 text-lg text-[#102033]"
-              aria-label="Open settings"
+              className="rounded-2xl border border-[#d7cfbe] bg-white/70 px-3 py-2 text-sm font-semibold text-[#102033]"
             >
-              ⚙
+              Settings
             </button>
           </div>
 
-          {screen === "home" && (
+          <div className="mt-5 flex items-center gap-2 rounded-[1.3rem] border border-white/60 bg-white/75 px-4 py-3">
+            <span
+              className={classNames(
+                "h-2.5 w-2.5 rounded-full",
+                statusTone === "active" && "bg-emerald-500",
+                statusTone === "warning" && "bg-amber-500",
+                statusTone === "danger" && "bg-rose-500",
+                statusTone === "ready" && "bg-slate-400",
+              )}
+            />
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold text-[#102033]">
+                {statusText}
+              </p>
+              <p className="truncate text-xs text-[#5a6472]">{syncText}</p>
+            </div>
+          </div>
+
+          {storageWarning && (
+            <div className="mt-3 rounded-[1.2rem] bg-amber-100 px-4 py-3 text-sm text-amber-900">
+              {storageWarning}
+            </div>
+          )}
+
+          {section === "relay" && (
             <section className="mt-6 space-y-4">
-              <div className="grid grid-cols-2 gap-3">
-                <article className="rounded-[1.6rem] bg-[#102033] p-4 text-white">
-                  <p className="text-xs uppercase tracking-[0.24em] text-white/65">
+              <div className="grid grid-cols-3 gap-3">
+                <article className="rounded-[1.4rem] bg-[#102033] p-4 text-white">
+                  <p className="text-xs uppercase tracking-[0.22em] text-white/60">
                     Stored
                   </p>
-                  <p className="mt-3 text-4xl font-semibold">{messages.length}</p>
+                  <p className="mt-2 text-3xl font-semibold">{messages.length}</p>
                 </article>
-                <article className="rounded-[1.6rem] bg-[#e35631] p-4 text-white">
-                  <p className="text-xs uppercase tracking-[0.24em] text-white/70">
-                    Temperature
+                <article className="rounded-[1.4rem] bg-[#e35631] p-4 text-white">
+                  <p className="text-xs uppercase tracking-[0.22em] text-white/60">
+                    Hot
                   </p>
-                  <p className="mt-3 text-2xl font-semibold">
-                    {totalHot > 0 ? `${totalHot} hot` : temperatureSummary}
+                  <p className="mt-2 text-3xl font-semibold">{topHotCount}</p>
+                </article>
+                <article className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4 text-[#102033]">
+                  <p className="text-xs uppercase tracking-[0.22em] text-[#945f3d]">
+                    Engine
+                  </p>
+                  <p className="mt-2 text-lg font-semibold">
+                    {topWarmCount} warm / {topColdCount} cold
                   </p>
                 </article>
               </div>
 
-              <button
-                type="button"
-                onClick={() => setScreen("send")}
-                className="flex w-full items-center justify-between rounded-[1.8rem] bg-[#102033] px-5 py-5 text-left text-white"
-              >
-                <span>
-                  <span className="block text-xs uppercase tracking-[0.24em] text-white/60">
-                    Create
-                  </span>
-                  <span className="mt-1 block text-2xl font-semibold">Send</span>
-                </span>
-                <span className="rounded-full bg-white/12 px-4 py-2 text-sm">
-                  Open
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setScreen("receive")}
-                className="flex w-full items-center justify-between rounded-[1.8rem] border border-[#d7cfbe] bg-white/80 px-5 py-5 text-left text-[#102033]"
-              >
-                <span>
-                  <span className="block text-xs uppercase tracking-[0.24em] text-[#945f3d]">
-                    Import
-                  </span>
-                  <span className="mt-1 block text-2xl font-semibold">Receive</span>
-                </span>
-                <span className="rounded-full bg-[#f2ebe0] px-4 py-2 text-sm">
-                  Open
-                </span>
-              </button>
-            </section>
-          )}
-
-          {screen === "send" && (
-            <section className="mt-6 space-y-4">
-              <button
-                type="button"
-                onClick={() => setComposeOpen(true)}
-                className="w-full rounded-[1.8rem] border border-[#d7cfbe] bg-white/85 p-5 text-left text-[#102033]"
-              >
-                <span className="block text-xs uppercase tracking-[0.24em] text-[#945f3d]">
-                  Compose
-                </span>
-                <span className="mt-2 block text-2xl font-semibold">New Message</span>
-                <span className="mt-3 block text-sm text-[#5a6472]">
-                  Create and store a message on this device before sharing.
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => void handleSnapshotShare()}
-                className="w-full rounded-[1.8rem] bg-[#102033] p-5 text-left text-white"
-              >
-                <span className="block text-xs uppercase tracking-[0.24em] text-white/60">
-                  Snapshot
-                </span>
-                <span className="mt-2 block text-2xl font-semibold">QR Code</span>
-                <span className="mt-3 block text-sm text-white/72">
-                  Show the top-priority bundle fullscreen.
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => void handleCreateOffer()}
-                className="w-full rounded-[1.8rem] bg-[#d8ead9] p-5 text-left text-[#183f27]"
-              >
-                <span className="block text-xs uppercase tracking-[0.24em] text-[#55745d]">
-                  Peer Link
-                </span>
-                <span className="mt-2 block text-2xl font-semibold">
-                  Connect to Device
-                </span>
-                <span className="mt-3 block text-sm text-[#44604c]">
-                  Create an offer QR, then scan the answer.
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => void handleBroadcastTopMessage()}
-                className="w-full rounded-[1.8rem] bg-[#f3dcbf] p-5 text-left text-[#6f3f17]"
-              >
-                <span className="block text-xs uppercase tracking-[0.24em] text-[#9a6130]">
-                  Loudspeaker
-                </span>
-                <span className="mt-2 block text-2xl font-semibold">
-                  Broadcast Audio
-                </span>
-                <span className="mt-3 block text-sm text-[#885226]">
-                  Speak the highest-priority stored message.
-                </span>
-              </button>
-
-              {offerToken && (
+              <div className="grid grid-cols-2 gap-3">
                 <button
                   type="button"
-                  onClick={() => openScanner("answer")}
-                  className="w-full rounded-[1.3rem] border border-dashed border-[#d7cfbe] bg-white px-4 py-3 text-sm font-medium text-[#102033]"
+                  onClick={() => void handleShowSnapshotQr()}
+                  className="rounded-[1.5rem] bg-[#102033] px-4 py-4 text-left text-white"
                 >
-                  Scan answer QR to finish the connection
+                  <span className="block text-xs uppercase tracking-[0.22em] text-white/60">
+                    Share
+                  </span>
+                  <span className="mt-2 block text-xl font-semibold">
+                    Snapshot QR
+                  </span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setSection("connect")}
+                  className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/80 px-4 py-4 text-left text-[#102033]"
+                >
+                  <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
+                    Encounter
+                  </span>
+                  <span className="mt-2 block text-xl font-semibold">
+                    Open Connect
+                  </span>
+                </button>
+              </div>
+
+              <div className="space-y-3">
+                {messages.map((message) => (
+                  <button
+                    key={message.id}
+                    type="button"
+                    onClick={() => setSelectedMessage(message)}
+                    className="w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <span
+                          className={classNames(
+                            "h-3 w-3 rounded-full",
+                            temperatureDot(message.temperature),
+                          )}
+                        />
+                        <span className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                          {messageLabel(message.type)}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {message.is_conflicted && (
+                          <span className="rounded-full bg-amber-100 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-900">
+                            Conflict
+                          </span>
+                        )}
+                        {message.is_superseded && (
+                          <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-700">
+                            Updated
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <p className="mt-3 text-lg leading-6 font-medium text-[#102033]">
+                      {message.payload}
+                    </p>
+                    <div className="mt-3 flex items-center gap-3 text-xs text-[#5a6472]">
+                      <span>priority {message.priority}</span>
+                      <span>{message.temperature}</span>
+                      <span>score {message.score.toFixed(2)}</span>
+                    </div>
+                  </button>
+                ))}
+
+                {messages.length === 0 && (
+                  <div className="rounded-[1.5rem] border border-dashed border-[#d7cfbe] px-4 py-8 text-center text-sm text-[#5a6472]">
+                    No messages stored yet. Compose one to start the relay.
+                  </div>
+                )}
+              </div>
+
+              {developerMode && (
+                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/80 p-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                        Developer
+                      </p>
+                      <h2 className="mt-1 text-lg font-semibold text-[#102033]">
+                        Relay Visibility
+                      </h2>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setDevPanelOpen((current) => !current)}
+                      className="rounded-full bg-[#102033] px-3 py-2 text-xs font-semibold text-white"
+                    >
+                      {devPanelOpen ? "Hide" : "Show"}
+                    </button>
+                  </div>
+
+                  {devPanelOpen && (
+                    <div className="mt-4 space-y-4 text-sm text-[#102033]">
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="rounded-[1.2rem] bg-slate-100 px-3 py-3">
+                          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">
+                            Sync
+                          </p>
+                          <p className="mt-2">
+                            novel {devState.syncStats.lastNovelCount} / sent{" "}
+                            {devState.syncStats.lastSentCount} / received{" "}
+                            {devState.syncStats.lastReceivedCount}
+                          </p>
+                        </div>
+                        <div className="rounded-[1.2rem] bg-slate-100 px-3 py-3">
+                          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">
+                            Quarantine
+                          </p>
+                          <p className="mt-2">{devState.quarantineCount} stored</p>
+                        </div>
+                      </div>
+
+                      <div className="rounded-[1.2rem] bg-slate-100 px-3 py-3">
+                        <p className="text-xs uppercase tracking-[0.18em] text-slate-500">
+                          Raw Payloads
+                        </p>
+                        <p className="mt-2 break-all font-mono text-xs">
+                          snapshot: {devState.lastSnapshotPayload || "none"}
+                        </p>
+                        <p className="mt-2 break-all font-mono text-xs">
+                          offer: {devState.lastOfferToken || "none"}
+                        </p>
+                        <p className="mt-2 break-all font-mono text-xs">
+                          answer: {devState.lastAnswerToken || "none"}
+                        </p>
+                      </div>
+
+                      <div className="space-y-2">
+                        {devState.runs.map((run) => (
+                          <div
+                            key={run.id}
+                            className="rounded-[1.2rem] border border-slate-200 px-3 py-3"
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <span
+                                className={classNames(
+                                  "rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]",
+                                  run.status === "failed"
+                                    ? toneClasses("danger")
+                                    : run.status === "partial"
+                                      ? toneClasses("warning")
+                                      : toneClasses("active"),
+                                )}
+                              >
+                                {run.mode}
+                              </span>
+                              <span className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                                {run.stages.length} components
+                              </span>
+                            </div>
+                            <p className="mt-2 text-sm font-medium text-[#102033]">
+                              {run.summary}
+                            </p>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {run.stages.map((stage) => (
+                                <span
+                                  key={`${run.id}-${stage.component}`}
+                                  className={classNames(
+                                    "rounded-full px-2 py-1 text-[10px] font-semibold",
+                                    stage.status === "error"
+                                      ? toneClasses("danger")
+                                      : stage.status === "warning"
+                                        ? toneClasses("warning")
+                                        : stage.status === "success"
+                                          ? toneClasses("active")
+                                          : toneClasses("ready"),
+                                  )}
+                                >
+                                  {stage.component}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+
+                        {devState.logs.map((entry) => (
+                          <div
+                            key={entry.id}
+                            className="rounded-[1.2rem] border border-slate-200 px-3 py-3"
+                          >
+                            <span
+                              className={classNames(
+                                "rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]",
+                                toneClasses(entry.tone),
+                              )}
+                            >
+                              {entry.title}
+                            </span>
+                            <p className="mt-2 text-sm text-[#425061]">
+                              {entry.detail}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </section>
               )}
             </section>
           )}
 
-          {screen === "receive" && (
+          {section === "compose" && (
             <section className="mt-6 space-y-4">
+              <div className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                  Compose
+                </p>
+                <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
+                  Create a relay message
+                </h2>
+                <p className="mt-2 text-sm text-[#5a6472]">
+                  Save returns you to Relay with the new message ranked by the
+                  relay engine.
+                </p>
+              </div>
+
+              {draftSupersedes && (
+                <div className="rounded-[1.3rem] bg-amber-100 px-4 py-3 text-sm text-amber-900">
+                  This message will be stored as an update to{" "}
+                  <span className="font-mono">{draftSupersedes}</span>.
+                </div>
+              )}
+
+              <div className="grid grid-cols-3 gap-2">
+                {(["text", "alert"] as MessageType[]).map((type) => (
+                  <button
+                    key={type}
+                    type="button"
+                    onClick={() => setDraftType(type)}
+                    className={classNames(
+                      "rounded-[1.1rem] px-3 py-3 text-sm font-medium",
+                      draftType === type
+                        ? "bg-[#102033] text-white"
+                        : "bg-white text-[#102033]",
+                    )}
+                  >
+                    {messageLabel(type)}
+                  </button>
+                ))}
+              </div>
+
+              <textarea
+                value={draftText}
+                onChange={(event) => setDraftText(event.target.value)}
+                className="h-44 w-full rounded-[1.5rem] border border-[#d8d0bf] bg-white px-4 py-4 text-base text-[#102033] outline-none"
+                placeholder="Road blocked at main gate."
+              />
+
+              <label className="block text-sm text-[#5a6472]">
+                Priority
+                <select
+                  value={draftPriority}
+                  onChange={(event) =>
+                    setDraftPriority(
+                      Number(event.target.value) as 1 | 2 | 3 | 4 | 5,
+                    )
+                  }
+                  className="mt-2 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+                >
+                  <option value={1}>1</option>
+                  <option value={2}>2</option>
+                  <option value={3}>3</option>
+                  <option value={4}>4</option>
+                  <option value={5}>5</option>
+                </select>
+              </label>
+
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDraftText("");
+                    setDraftSupersedes(undefined);
+                    setSection("relay");
+                  }}
+                  className="rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSaveDraft()}
+                  className="rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white"
+                >
+                  Save Message
+                </button>
+              </div>
+            </section>
+          )}
+
+          {section === "connect" && (
+            <section className="mt-6 space-y-4">
+              <div className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                  Hotspot Flow
+                </p>
+                <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
+                  WebRTC over local hotspot
+                </h2>
+                <ol className="mt-3 space-y-2 text-sm text-[#5a6472]">
+                  <li>1. One device creates a hotspot named like NEXUS-XXXX.</li>
+                  <li>2. The other device joins that hotspot.</li>
+                  <li>3. Create an offer QR or scan one to join the encounter.</li>
+                  <li>4. Keep relaying while the peer link stays open.</li>
+                </ol>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void handleCreateOffer()}
+                className="w-full rounded-[1.5rem] bg-[#102033] px-4 py-5 text-left text-white"
+              >
+                <span className="block text-xs uppercase tracking-[0.22em] text-white/60">
+                  Initiator
+                </span>
+                <span className="mt-2 block text-2xl font-semibold">
+                  Create Offer QR
+                </span>
+              </button>
+
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => openScanner("offer")}
+                  className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left text-[#102033]"
+                >
+                  <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
+                    Joiner
+                  </span>
+                  <span className="mt-2 block text-xl font-semibold">
+                    Scan Offer
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => openScanner("answer")}
+                  className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left text-[#102033]"
+                >
+                  <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
+                    Initiator
+                  </span>
+                  <span className="mt-2 block text-xl font-semibold">
+                    Scan Answer
+                  </span>
+                </button>
+              </div>
+
               <button
                 type="button"
                 onClick={() => openScanner("snapshot")}
-                className="w-full rounded-[1.8rem] bg-[#102033] p-5 text-left text-white"
+                className="w-full rounded-[1.4rem] border border-dashed border-[#d7cfbe] bg-white px-4 py-4 text-left text-[#102033]"
               >
-                <span className="block text-xs uppercase tracking-[0.24em] text-white/60">
-                  Camera
+                <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
+                  Fallback
                 </span>
-                <span className="mt-2 block text-2xl font-semibold">Scan QR</span>
-                <span className="mt-3 block text-sm text-white/72">
-                  Import a snapshot bundle from another device.
+                <span className="mt-2 block text-xl font-semibold">
+                  Scan Snapshot QR
                 </span>
               </button>
 
-              <button
-                type="button"
-                onClick={() => openScanner("offer")}
-                className="w-full rounded-[1.8rem] bg-[#d8ead9] p-5 text-left text-[#183f27]"
-              >
-                <span className="block text-xs uppercase tracking-[0.24em] text-[#55745d]">
-                  Peer Link
-                </span>
-                <span className="mt-2 block text-2xl font-semibold">
-                  Accept Connection
-                </span>
-                <span className="mt-3 block text-sm text-[#44604c]">
-                  Scan the offer, then return the answer QR.
-                </span>
-              </button>
-
-              <div className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/80 px-4 py-4">
-                <p className="text-xs uppercase tracking-[0.24em] text-[#945f3d]">
-                  Live Sync
+              <div className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-4 py-4">
+                <p className="text-xs uppercase tracking-[0.22em] text-[#945f3d]">
+                  Peer Status
                 </p>
                 <p className="mt-2 text-lg font-semibold text-[#102033]">
-                  {syncStatus}
+                  {syncText}
                 </p>
                 <p className="mt-2 text-sm text-[#5a6472]">{scannerStatus}</p>
               </div>
             </section>
           )}
 
-          {screen === "messages" && (
-            <section className="mt-6 space-y-3">
-              {messages.map((message) => (
-                <button
-                  key={message.id}
-                  type="button"
-                  onClick={() => setSelectedMessage(message)}
-                  className="w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/80 px-4 py-4 text-left"
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-3">
-                      <span
-                        className={classNames(
-                          "h-3 w-3 rounded-full",
-                          temperatureDot(message.temperature),
-                        )}
-                      />
-                      <span className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                        {message.type === "audio" ? "Mic" : messageLabel(message.type)}
-                      </span>
-                    </div>
-                    {message.type === "audio" && (
-                      <span className="text-lg text-[#102033]">🎙</span>
-                    )}
-                  </div>
-                  <p className="mt-3 text-lg leading-6 font-medium text-[#102033]">
-                    {message.payload}
-                  </p>
-                </button>
-              ))}
-
-              {messages.length === 0 && (
-                <div className="rounded-[1.5rem] border border-dashed border-[#d7cfbe] px-4 py-8 text-center text-sm text-[#5a6472]">
-                  No messages stored yet.
-                </div>
-              )}
-            </section>
-          )}
-
-          <p className="mt-5 rounded-[1.2rem] bg-white/70 px-4 py-3 text-sm text-[#425061]">
-            {status}
-          </p>
-
-          <nav className="mt-5 grid grid-cols-4 gap-2 rounded-[1.6rem] bg-[#eadfce] p-2">
-            {(["home", "send", "receive", "messages"] as Screen[]).map((item) => (
+          <nav className="mt-6 grid grid-cols-3 gap-2 rounded-[1.6rem] bg-[#eadfce] p-2">
+            {(["relay", "compose", "connect"] as Section[]).map((item) => (
               <button
                 key={item}
                 type="button"
-                onClick={() => setScreen(item)}
+                onClick={() => setSection(item)}
                 className={classNames(
                   "rounded-[1.1rem] px-3 py-3 text-sm font-medium capitalize",
-                  screen === item
+                  section === item
                     ? "bg-[#102033] text-white"
                     : "text-[#5a6472]",
                 )}
@@ -775,82 +1360,8 @@ export function NexusApp() {
               </button>
             ))}
           </nav>
-
-          <div className="mt-4 flex items-center justify-between text-xs text-[#6f7884]">
-            <span>{messages.length} stored</span>
-            <Link href="/lab" className="font-semibold text-[#945f3d]">
-              Open debug harness
-            </Link>
-          </div>
         </div>
       </section>
-
-      {composeOpen && (
-        <div className="fixed inset-0 z-40 flex items-end bg-[#102033]/40 p-4">
-          <section className="w-full rounded-[2rem] bg-[#f8f4eb] p-5 shadow-2xl">
-            <div className="flex items-center justify-between">
-              <h2 className="text-2xl font-semibold text-[#102033]">New Message</h2>
-              <button
-                type="button"
-                onClick={() => setComposeOpen(false)}
-                className="rounded-full bg-white px-3 py-2 text-sm text-[#102033]"
-              >
-                Close
-              </button>
-            </div>
-
-            <div className="mt-4 grid grid-cols-3 gap-2">
-              {(["text", "alert", "audio"] as ComposeType[]).map((type) => (
-                <button
-                  key={type}
-                  type="button"
-                  onClick={() => setDraftType(type)}
-                  className={classNames(
-                    "rounded-[1.1rem] px-3 py-3 text-sm font-medium",
-                    draftType === type
-                      ? "bg-[#102033] text-white"
-                      : "bg-white text-[#102033]",
-                  )}
-                >
-                  {messageLabel(type)}
-                </button>
-              ))}
-            </div>
-
-            <textarea
-              value={draftText}
-              onChange={(event) => setDraftText(event.target.value)}
-              className="mt-4 h-36 w-full rounded-[1.5rem] border border-[#d8d0bf] bg-white px-4 py-4 text-base text-[#102033] outline-none"
-              placeholder="Road blocked at main gate."
-            />
-
-            <label className="mt-4 block text-sm text-[#5a6472]">
-              Priority
-              <select
-                value={draftPriority}
-                onChange={(event) =>
-                  setDraftPriority(Number(event.target.value) as 1 | 2 | 3 | 4 | 5)
-                }
-                className="mt-2 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
-              >
-                <option value={1}>1</option>
-                <option value={2}>2</option>
-                <option value={3}>3</option>
-                <option value={4}>4</option>
-                <option value={5}>5</option>
-              </select>
-            </label>
-
-            <button
-              type="button"
-              onClick={() => void handleSaveDraft()}
-              className="mt-4 w-full rounded-[1.4rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white"
-            >
-              Save To Device
-            </button>
-          </section>
-        </div>
-      )}
 
       {settingsOpen && (
         <div className="fixed inset-0 z-40 flex items-end bg-[#102033]/40 p-4">
@@ -866,43 +1377,110 @@ export function NexusApp() {
               </button>
             </div>
 
-            <div className="mt-4 space-y-3">
-              <input
-                value={pinSetup}
-                onChange={(event) => setPinSetup(event.target.value)}
-                className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
-                inputMode="numeric"
-                placeholder="Set 6-digit PIN"
-              />
+            <div className="mt-4 grid grid-cols-3 gap-2">
               <button
                 type="button"
-                onClick={() => void handleSavePin()}
-                className="w-full rounded-[1.2rem] bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
+                onClick={() => setSecuritySection("security")}
+                className={classNames(
+                  "rounded-[1rem] px-3 py-3 text-sm font-semibold",
+                  securitySection === "security"
+                    ? "bg-[#102033] text-white"
+                    : "bg-white text-[#102033]",
+                )}
               >
-                Save PIN
+                Security
               </button>
               <button
                 type="button"
-                onClick={() => setPinLocked(Boolean(pinHash))}
-                className="w-full rounded-[1.2rem] bg-white px-4 py-3 text-sm font-semibold text-[#102033]"
+                onClick={() => setSecuritySection("emergency")}
+                className={classNames(
+                  "rounded-[1rem] px-3 py-3 text-sm font-semibold",
+                  securitySection === "emergency"
+                    ? "bg-[#102033] text-white"
+                    : "bg-white text-[#102033]",
+                )}
               >
-                Lock App Now
+                Emergency
               </button>
               <button
                 type="button"
-                onClick={() => void handleToggleShake()}
-                className="w-full rounded-[1.2rem] bg-[#f3dcbf] px-4 py-3 text-sm font-semibold text-[#6f3f17]"
+                onClick={() => setSecuritySection("developer")}
+                disabled={!developerUnlocked}
+                className={classNames(
+                  "rounded-[1rem] px-3 py-3 text-sm font-semibold",
+                  !developerUnlocked && "cursor-not-allowed opacity-50",
+                  securitySection === "developer"
+                    ? "bg-[#102033] text-white"
+                    : "bg-white text-[#102033]",
+                )}
               >
-                {shakeArmed ? "Disarm Triple Shake" : "Arm Triple Shake"}
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleEmergencyWipe()}
-                className="w-full rounded-[1.2rem] bg-[#9f2f24] px-4 py-3 text-sm font-semibold text-white"
-              >
-                Emergency Wipe
+                Developer
               </button>
             </div>
+
+            {securitySection === "security" && (
+              <div className="mt-4 space-y-3">
+                <input
+                  value={pinSetup}
+                  onChange={(event) => setPinSetup(event.target.value)}
+                  className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+                  inputMode="numeric"
+                  placeholder="Set 6-digit PIN"
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleSavePin()}
+                  className="w-full rounded-[1.2rem] bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
+                >
+                  Save PIN
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPinLocked(Boolean(pinHash))}
+                  className="w-full rounded-[1.2rem] bg-white px-4 py-3 text-sm font-semibold text-[#102033]"
+                >
+                  Lock App Now
+                </button>
+              </div>
+            )}
+
+            {securitySection === "emergency" && (
+              <div className="mt-4 space-y-3">
+                <button
+                  type="button"
+                  onClick={() => void handleToggleShake()}
+                  className="w-full rounded-[1.2rem] bg-[#f3dcbf] px-4 py-3 text-sm font-semibold text-[#6f3f17]"
+                >
+                  {shakeArmed ? "Disarm Triple Shake" : "Arm Triple Shake"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleEmergencyWipe()}
+                  className="w-full rounded-[1.2rem] bg-[#9f2f24] px-4 py-3 text-sm font-semibold text-white"
+                >
+                  Emergency Wipe
+                </button>
+              </div>
+            )}
+
+            {securitySection === "developer" && developerUnlocked && (
+              <div className="mt-4 space-y-3">
+                <button
+                  type="button"
+                  onClick={() => setDeveloperMode((current) => !current)}
+                  className="w-full rounded-[1.2rem] bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
+                >
+                  {developerMode ? "Disable Dev Panel" : "Enable Dev Panel"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleManualQuarantineDemo()}
+                  className="w-full rounded-[1.2rem] bg-white px-4 py-3 text-sm font-semibold text-[#102033]"
+                >
+                  Run Quarantine Demo
+                </button>
+              </div>
+            )}
 
             <p className="mt-4 text-sm text-[#5a6472]">{sentinelStatus}</p>
           </section>
@@ -918,9 +1496,9 @@ export function NexusApp() {
                   Camera
                 </p>
                 <h2 className="mt-2 text-2xl font-semibold">
-                  {scannerMode === "answer" && "Scan answer QR"}
-                  {scannerMode === "offer" && "Scan offer QR"}
-                  {scannerMode === "snapshot" && "Scan snapshot QR"}
+                  {scannerMode === "snapshot" && "Scan Snapshot QR"}
+                  {scannerMode === "offer" && "Scan Offer QR"}
+                  {scannerMode === "answer" && "Scan Answer QR"}
                 </h2>
               </div>
               <button
@@ -931,8 +1509,14 @@ export function NexusApp() {
                 Close
               </button>
             </div>
+
             <div className="mt-6 flex-1 overflow-hidden rounded-[2rem] border border-white/10 bg-black">
-              <video ref={videoRef} className="h-full w-full object-cover" muted playsInline />
+              <video
+                ref={videoRef}
+                className="h-full w-full object-cover"
+                muted
+                playsInline
+              />
             </div>
             <p className="mt-4 text-sm text-white/70">{scannerStatus}</p>
           </div>
@@ -946,12 +1530,24 @@ export function NexusApp() {
               Nexus Relay
             </p>
             <h2 className="mt-3 text-center text-3xl font-semibold text-[#102033]">
-              {activeQrLabel}
+              {activeQrTitle}
             </h2>
+
+            {activeQrStatus && (
+              <span
+                className={classNames(
+                  "mt-4 rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em]",
+                  toneClasses(activeQrStatus.tone),
+                )}
+              >
+                {activeQrStatus.label}
+              </span>
+            )}
+
             <div className="mt-6 w-full rounded-[2rem] bg-white p-4 shadow-[0_18px_60px_rgba(16,32,51,0.14)]">
               <Image
                 src={activeQrUrl}
-                alt={activeQrLabel}
+                alt={activeQrTitle}
                 width={1200}
                 height={1200}
                 unoptimized
@@ -959,11 +1555,7 @@ export function NexusApp() {
               />
             </div>
             <p className="mt-5 text-center text-sm text-[#5a6472]">
-              {activeQrLabel === "Connection answer"
-                ? "Show this back to the sender, then sync will continue in the background."
-                : activeQrLabel === "Connection offer"
-                  ? "The receiver scans this, then you scan the answer QR."
-                  : "The receiver can scan this directly to import the snapshot."}
+              {activeQrDetail}
             </p>
             <button
               type="button"
@@ -979,7 +1571,7 @@ export function NexusApp() {
       {selectedMessage && (
         <div className="fixed inset-0 z-40 flex items-end bg-[#102033]/40 p-4">
           <section className="w-full rounded-[2rem] bg-[#f8f4eb] p-5 shadow-2xl">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-3">
               <div className="flex items-center gap-3">
                 <span
                   className={classNames(
@@ -988,9 +1580,7 @@ export function NexusApp() {
                   )}
                 />
                 <span className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                  {selectedMessage.type === "audio"
-                    ? "Mic"
-                    : messageLabel(selectedMessage.type)}
+                  {messageLabel(selectedMessage.type)}
                 </span>
               </div>
               <button
@@ -1001,16 +1591,52 @@ export function NexusApp() {
                 Close
               </button>
             </div>
+
             <p className="mt-5 text-2xl leading-8 font-semibold text-[#102033]">
               {selectedMessage.payload}
             </p>
-            <button
-              type="button"
-              onClick={() => void broadcastMessage(selectedMessage)}
-              className="mt-6 w-full rounded-[1.4rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white"
-            >
-              Broadcast
-            </button>
+
+            <div className="mt-5 grid grid-cols-2 gap-3 text-sm text-[#425061]">
+              <div className="rounded-[1.2rem] bg-white px-4 py-3">
+                <p>priority {selectedMessage.priority}</p>
+                <p className="mt-1">score {selectedMessage.score.toFixed(2)}</p>
+              </div>
+              <div className="rounded-[1.2rem] bg-white px-4 py-3">
+                <p>{selectedMessage.temperature}</p>
+                <p className="mt-1">
+                  display confidence {selectedMessage.merge_confidence.toFixed(2)}
+                </p>
+              </div>
+            </div>
+
+            {(selectedMessage.is_conflicted || selectedMessage.is_superseded) && (
+              <div className="mt-4 rounded-[1.2rem] bg-amber-100 px-4 py-3 text-sm text-amber-900">
+                {selectedMessage.is_conflicted &&
+                  `This message has related versions or conflicts: ${selectedMessage.conflict_ids.join(", ")}.`}
+                {selectedMessage.is_superseded &&
+                  " This record has been superseded by a newer local variant."}
+              </div>
+            )}
+
+            <div className="mt-6 grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedMessage(null);
+                  void handleShowSnapshotQr();
+                }}
+                className="rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]"
+              >
+                Share Snapshot
+              </button>
+              <button
+                type="button"
+                onClick={() => beginCompose(selectedMessage)}
+                className="rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white"
+              >
+                Create Update
+              </button>
+            </div>
           </section>
         </div>
       )}

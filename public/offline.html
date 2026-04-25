@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nexus Relay Offline</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f8f4eb;
+        --fg: #102033;
+        --muted: #5a6472;
+        --accent: #e35631;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        font-family: "Segoe UI", sans-serif;
+        color: var(--fg);
+        background:
+          radial-gradient(circle at top, rgba(227, 86, 49, 0.18), transparent 40%),
+          linear-gradient(135deg, #fbf4e8 0%, var(--bg) 100%);
+      }
+
+      .card {
+        width: min(100%, 440px);
+        border-radius: 28px;
+        background: rgba(255, 255, 255, 0.88);
+        padding: 28px;
+        box-shadow: 0 20px 80px rgba(16, 32, 51, 0.12);
+      }
+
+      .eyebrow {
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.28em;
+        text-transform: uppercase;
+        color: #945f3d;
+      }
+
+      h1 {
+        margin: 14px 0 0;
+        font-size: 34px;
+        line-height: 1.1;
+      }
+
+      p {
+        margin: 14px 0 0;
+        color: var(--muted);
+        line-height: 1.55;
+      }
+
+      .pill {
+        display: inline-block;
+        margin-top: 18px;
+        border-radius: 999px;
+        background: #102033;
+        color: white;
+        padding: 10px 14px;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <div class="eyebrow">Nexus Relay</div>
+      <h1>You are offline.</h1>
+      <p>
+        The app shell is installed, but this route was not available from cache.
+        Reopen the main app screen once the device regains local access.
+      </p>
+      <div class="pill">Offline fallback active</div>
+    </main>
+  </body>
+</html>

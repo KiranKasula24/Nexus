@@ -8,7 +8,7 @@ import type {
 import type { NexusRepository } from "./repository";
 
 const ALLOWED_TYPES = new Set(["text", "audio", "alert"]);
-const QUARANTINE_KEY = "quarantine";
+export const QUARANTINE_KEY = "quarantine";
 
 function isPriority(value: number): value is 1 | 2 | 3 | 4 | 5 {
   return Number.isInteger(value) && value >= 1 && value <= 5;

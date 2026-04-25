@@ -90,6 +90,10 @@ export async function clearStores(
 }
 
 export function deleteBridgeDb(dbName = NEXUS_DB_NAME): Promise<void> {
+  if (typeof indexedDB === "undefined") {
+    return Promise.resolve();
+  }
+
   return new Promise((resolve, reject) => {
     const request = indexedDB.deleteDatabase(dbName);
     request.onsuccess = () => resolve();

@@ -27,28 +27,116 @@ export interface EncounterLogEntry {
   message_ids_exchanged: string[];
 }
 
+interface InMemoryState {
+  messages: Map<string, NexusMessage>;
+  systemState: Map<string, unknown>;
+  encounterLog: Map<string, EncounterLogEntry>;
+}
+
+function createInMemoryState(): InMemoryState {
+  return {
+    messages: new Map<string, NexusMessage>(),
+    systemState: new Map<string, unknown>(),
+    encounterLog: new Map<string, EncounterLogEntry>(),
+  };
+}
+
+function withConflictMetadata(
+  messages: NexusMessage[],
+): NexusMessageWithComputed[] {
+  const supersededMap = new Map<string, NexusMessage[]>();
+
+  for (const message of messages) {
+    if (!message.supersedes) continue;
+    const existing = supersededMap.get(message.supersedes) ?? [];
+    existing.push(message);
+    supersededMap.set(message.supersedes, existing);
+  }
+
+  return messages
+    .map((message) => {
+      const base = { ...message, ...computeFields(message) };
+      const related = new Set<string>();
+
+      if (message.supersedes) {
+        related.add(message.supersedes);
+        for (const sibling of supersededMap.get(message.supersedes) ?? []) {
+          if (sibling.id !== message.id) {
+            related.add(sibling.id);
+          }
+        }
+      }
+
+      for (const sibling of supersededMap.get(message.id) ?? []) {
+        related.add(sibling.id);
+      }
+
+      return {
+        ...base,
+        is_conflicted: related.size > 0,
+        conflict_ids: [...related],
+      };
+    })
+    .sort((a, b) => {
+      if (b.score === a.score) {
+        return b.merge_confidence - a.merge_confidence;
+      }
+      return b.score - a.score;
+    });
+}
+
 export class NexusRepository {
-  private dbPromise: Promise<IDBDatabase>;
+  private dbPromise: Promise<IDBDatabase | null>;
+  private readonly memory: InMemoryState;
+  private usingMemory = false;
 
   constructor(dbName?: string) {
-    this.dbPromise = openBridgeDb(dbName ?? "bridge_db");
+    this.memory = createInMemoryState();
+    this.dbPromise = openBridgeDb(dbName ?? "bridge_db")
+      .then((db) => db)
+      .catch(() => {
+        this.usingMemory = true;
+        return null;
+      });
+  }
+
+  async isUsingMemoryStorage(): Promise<boolean> {
+    await this.dbPromise;
+    return this.usingMemory;
+  }
+
+  private async getDb(): Promise<IDBDatabase | null> {
+    return this.dbPromise;
   }
 
   async getAll(): Promise<NexusMessageWithComputed[]> {
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      return withConflictMetadata(
+        [...this.memory.messages.values()].filter(
+          (message) => message.ttl >= nowUnixSeconds(),
+        ),
+      );
+    }
+
     const tx = db.transaction(STORE_MESSAGES, "readonly");
     const store = tx.objectStore(STORE_MESSAGES);
     const rows = (await requestResult(store.getAll())) as NexusMessage[];
     await txDone(tx);
 
-    return rows
-      .filter((message) => message.ttl >= nowUnixSeconds())
-      .map((m) => ({ ...m, ...computeFields(m) }))
-      .sort((a, b) => b.score - a.score);
+    return withConflictMetadata(
+      rows.filter((message) => message.ttl >= nowUnixSeconds()),
+    );
   }
 
   async getById(id: string): Promise<NexusMessageWithComputed | undefined> {
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      const row = this.memory.messages.get(id);
+      if (!row || row.ttl < nowUnixSeconds()) return undefined;
+      return (await this.getAll()).find((message) => message.id === id);
+    }
+
     const tx = db.transaction(STORE_MESSAGES, "readonly");
     const store = tx.objectStore(STORE_MESSAGES);
     const row = (await requestResult(store.get(id))) as
@@ -57,7 +145,7 @@ export class NexusRepository {
     await txDone(tx);
 
     if (!row || row.ttl < nowUnixSeconds()) return undefined;
-    return { ...row, ...computeFields(row) };
+    return (await this.getAll()).find((message) => message.id === id);
   }
 
   async getByType(
@@ -75,7 +163,13 @@ export class NexusRepository {
   }
 
   async getAllRaw(): Promise<NexusMessage[]> {
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      return [...this.memory.messages.values()].filter(
+        (message) => message.ttl >= nowUnixSeconds(),
+      );
+    }
+
     const tx = db.transaction(STORE_MESSAGES, "readonly");
     const rows = (await requestResult(
       tx.objectStore(STORE_MESSAGES).getAll(),
@@ -85,7 +179,13 @@ export class NexusRepository {
   }
 
   async put(message: NexusMessage): Promise<void> {
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      this.memory.messages.set(message.id, message);
+      await this.sweepExpired();
+      return;
+    }
+
     const tx = db.transaction(STORE_MESSAGES, "readwrite");
     tx.objectStore(STORE_MESSAGES).put(message);
     await txDone(tx);
@@ -94,7 +194,15 @@ export class NexusRepository {
   }
 
   async putMany(messages: NexusMessage[]): Promise<void> {
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      for (const message of messages) {
+        this.memory.messages.set(message.id, message);
+      }
+      await this.sweepExpired();
+      return;
+    }
+
     const tx = db.transaction(STORE_MESSAGES, "readwrite");
     const store = tx.objectStore(STORE_MESSAGES);
     for (const message of messages) {
@@ -106,7 +214,18 @@ export class NexusRepository {
   }
 
   async sweepExpired(now = nowUnixSeconds()): Promise<number> {
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      let deleted = 0;
+      for (const [id, message] of this.memory.messages.entries()) {
+        if (message.ttl < now) {
+          this.memory.messages.delete(id);
+          deleted += 1;
+        }
+      }
+      return deleted;
+    }
+
     const tx = db.transaction(STORE_MESSAGES, "readwrite");
     const store = tx.objectStore(STORE_MESSAGES);
     const all = (await requestResult(store.getAll())) as NexusMessage[];
@@ -132,11 +251,14 @@ export class NexusRepository {
   }
 
   async runEviction(): Promise<number> {
+    if (this.usingMemory) return 0;
+
     const estimate = await navigator.storage?.estimate?.();
     if (!estimate?.usage) return 0;
     if (estimate.usage <= EVICTION_TRIGGER_BYTES) return 0;
 
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) return 0;
     const tx = db.transaction(STORE_MESSAGES, "readwrite");
     const store = tx.objectStore(STORE_MESSAGES);
     const all = (await requestResult(store.getAll())) as NexusMessage[];
@@ -172,7 +294,14 @@ export class NexusRepository {
   async deleteByIds(ids: string[]): Promise<void> {
     if (ids.length === 0) return;
 
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      for (const id of ids) {
+        this.memory.messages.delete(id);
+      }
+      return;
+    }
+
     const tx = db.transaction(STORE_MESSAGES, "readwrite");
     const store = tx.objectStore(STORE_MESSAGES);
     for (const id of ids) {
@@ -185,23 +314,41 @@ export class NexusRepository {
     sessionId: string;
     messageIdsExchanged: string[];
   }): Promise<void> {
-    const db = await this.dbPromise;
-    const tx = db.transaction(STORE_ENCOUNTER_LOG, "readwrite");
-    tx.objectStore(STORE_ENCOUNTER_LOG).put({
+    const nextEntry = {
       session_id: entry.sessionId,
       approximate_time: floorToHour(nowUnixSeconds()),
       message_ids_exchanged: entry.messageIdsExchanged,
-    } satisfies EncounterLogEntry);
+    } satisfies EncounterLogEntry;
+
+    const db = await this.getDb();
+    if (!db) {
+      this.memory.encounterLog.set(entry.sessionId, nextEntry);
+      return;
+    }
+
+    const tx = db.transaction(STORE_ENCOUNTER_LOG, "readwrite");
+    tx.objectStore(STORE_ENCOUNTER_LOG).put(nextEntry);
     await txDone(tx);
   }
 
   async clearAllStores(): Promise<void> {
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      this.memory.messages.clear();
+      this.memory.systemState.clear();
+      this.memory.encounterLog.clear();
+      return;
+    }
+
     await clearStores(db, ALL_STORES);
   }
 
   async getSystemState<T = unknown>(key: string): Promise<T | undefined> {
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      return this.memory.systemState.get(key) as T | undefined;
+    }
+
     const tx = db.transaction(STORE_SYSTEM_STATE, "readonly");
     const row = (await requestResult(
       tx.objectStore(STORE_SYSTEM_STATE).get(key),
@@ -216,7 +363,12 @@ export class NexusRepository {
   }
 
   async setSystemState<T>(key: string, value: T): Promise<void> {
-    const db = await this.dbPromise;
+    const db = await this.getDb();
+    if (!db) {
+      this.memory.systemState.set(key, value);
+      return;
+    }
+
     const tx = db.transaction(STORE_SYSTEM_STATE, "readwrite");
     tx.objectStore(STORE_SYSTEM_STATE).put({ key, value });
     await txDone(tx);

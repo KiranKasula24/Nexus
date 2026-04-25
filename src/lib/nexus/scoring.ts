@@ -47,6 +47,14 @@ export function computeScore(
   return Number((numerator / denominator).toFixed(6));
 }
 
+export function computeMergeConfidence(
+  message: NexusMessage,
+  now = nowUnixSeconds(),
+): number {
+  const ageHours = hoursSince(message.created_at, now);
+  return Number((message.hop_count / (1 + ageHours)).toFixed(6));
+}
+
 export function computeFields(
   message: NexusMessage,
   now = nowUnixSeconds(),
@@ -55,8 +63,11 @@ export function computeFields(
   return {
     temperature,
     score: computeScore(message, now),
+    merge_confidence: computeMergeConfidence(message, now),
     is_expired: message.ttl < now,
     is_superseded: Boolean(message.superseded_by),
+    is_conflicted: false,
+    conflict_ids: [],
   };
 }
 

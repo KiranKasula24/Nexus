@@ -1,5 +1,7 @@
-const CACHE_NAME = "nexus-shell-v3";
+const CACHE_NAME = "nexus-shell-v5";
 const APP_SHELL = [
+  "/",
+  "/offline.html",
   "/manifest.json",
   "/favicon.ico",
   "/icon.svg",
@@ -34,7 +36,7 @@ self.addEventListener("fetch", (event) => {
         })
         .catch(async () => {
           const cached = await caches.match(event.request);
-          return cached ?? fetch(event.request);
+          return cached ?? caches.match("/offline.html");
         }),
     );
     return;
