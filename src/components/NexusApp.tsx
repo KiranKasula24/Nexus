@@ -2951,28 +2951,32 @@ export function NexusApp() {
               </span>
             )}
 
-            <div className="mt-6 w-full rounded-[2rem] bg-white p-4 shadow-[0_18px_60px_rgba(16,32,51,0.14)]">
-              <Image
-                src={snapshotQrUrl}
-                alt={snapshotQrTitle}
-                width={1200}
-                height={1200}
-                unoptimized
-                className="h-auto w-full"
-              />
+            <div className="mt-6 flex w-full flex-col items-center gap-4 sm:flex-row sm:items-start sm:justify-center">
+              <button
+                type="button"
+                onClick={hideSnapshotQr}
+                className={pressableCardClasses(
+                  "inline-flex items-center gap-2 rounded-[1.3rem] bg-[#102033] px-5 py-3 text-sm font-semibold text-white sm:self-center",
+                )}
+              >
+                <span aria-hidden="true">{"<-"}</span>
+                Back
+              </button>
+
+              <div className="w-full rounded-[2rem] bg-white p-4 shadow-[0_18px_60px_rgba(16,32,51,0.14)]">
+                <Image
+                  src={snapshotQrUrl}
+                  alt={snapshotQrTitle}
+                  width={1200}
+                  height={1200}
+                  unoptimized
+                  className="h-auto w-full"
+                />
+              </div>
             </div>
             <p className="mt-5 text-center text-sm text-[#5a6472]">
               {snapshotQrDetail}
             </p>
-            <button
-              type="button"
-              onClick={hideSnapshotQr}
-              className={pressableCardClasses(
-                "mt-6 rounded-[1.3rem] bg-[#102033] px-6 py-3 text-sm font-semibold text-white",
-              )}
-            >
-              Back
-            </button>
           </div>
         </div>
       )}
