@@ -161,6 +161,22 @@ function isIpHost(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(withoutPort);
 }
 
+function stripPort(host: string): string {
+  return host.replace(/:\d+$/, "");
+}
+
+function normalizeSignalingHostValue(host: string): string {
+  const normalized = host.trim();
+  if (!normalized) return normalized;
+
+  const baseHost = stripPort(normalized);
+  if (isLoopbackHost(baseHost) || isIpHost(baseHost)) {
+    return normalized;
+  }
+
+  return baseHost;
+}
+
 function toRawMessage(message: NexusMessageWithComputed): NexusMessage {
   return {
     id: message.id,
@@ -383,11 +399,13 @@ export function NexusApp() {
 
     const hostname = window.location.hostname;
     const port = window.location.port;
-    return port ? `${hostname}:${port}` : hostname;
+    return normalizeSignalingHostValue(port ? `${hostname}:${port}` : hostname);
   }
 
   function resolveSignalingHost(saved: string | null): string {
-    const normalizedSaved = normalizeHostInput(saved ?? "");
+    const normalizedSaved = normalizeSignalingHostValue(
+      normalizeHostInput(saved ?? ""),
+    );
     const fallback = runtimeDefaultHost();
 
     if (!normalizedSaved) return fallback;
@@ -408,8 +426,11 @@ export function NexusApp() {
   }
 
   function buildSignalUrl(room: string, role?: "offer" | "answer"): string {
-    const safeHost = signalingHost || runtimeDefaultHost();
-    const preferHttp = isLoopbackHost(safeHost) || isIpHost(safeHost);
+    const safeHost = normalizeSignalingHostValue(
+      signalingHost || runtimeDefaultHost(),
+    );
+    const preferHttp =
+      isLoopbackHost(stripPort(safeHost)) || isIpHost(stripPort(safeHost));
     const protocol = preferHttp ? "http" : "https";
     const base = `${protocol}://${safeHost}/api/signal/${room}`;
     if (!role) return base;
@@ -489,7 +510,7 @@ export function NexusApp() {
   }
 
   function saveSignalingHost(rawHost: string): void {
-    const host = normalizeHostInput(rawHost);
+    const host = normalizeSignalingHostValue(normalizeHostInput(rawHost));
     if (!host) return;
     localStorage.setItem(SIGNALING_HOST_KEY, host);
     setSignalingHost(host);
