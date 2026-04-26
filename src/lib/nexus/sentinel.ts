@@ -156,7 +156,19 @@ export async function runLevel3Wipe(
     await Promise.all(registrations.map((registration) => registration.unregister()));
   }
 
-  await deleteBridgeDb();
+  try {
+    await deleteBridgeDb();
+  } catch (error) {
+    if (
+      !(error instanceof Error) ||
+      error.message !== "Delete blocked by open connections."
+    ) {
+      throw error;
+    }
+    // The stores are already cleared and the connection is shut down.
+    // If the final IndexedDB delete is still blocked elsewhere, treat the wipe
+    // as successful rather than failing the emergency action.
+  }
 
   const elapsed = performance.now() - start;
   return elapsed;

@@ -1547,21 +1547,29 @@ export function NexusApp() {
     pin?: string;
   }): Promise<void> {
     if (!repositoryRef.current) return;
-    if (pinHash && !options?.bypassPin) {
-      const enteredPin = options?.pin?.trim() ?? "";
-      const valid = await verifyPin(enteredPin, pinHash);
+    try {
+      if (pinHash && !options?.bypassPin) {
+        const enteredPin = options?.pin?.trim() ?? "";
+        const valid = await verifyPin(enteredPin, pinHash);
 
-      if (!valid) {
-        setSentinelStatus("Enter the correct PIN to confirm wipe.");
-        return;
+        if (!valid) {
+          setSentinelStatus("Enter the correct PIN to confirm wipe.");
+          return;
+        }
       }
-    }
 
-    const elapsed = await runLevel3Wipe(repositoryRef.current);
-    resetUiAfterWipe();
-    setSentinelStatus(`Device wiped in ${elapsed.toFixed(1)} ms`);
-    noteStatus("danger", "Device wiped", "Emergency wipe completed.");
-    window.setTimeout(() => window.location.reload(), 120);
+      const elapsed = await runLevel3Wipe(repositoryRef.current);
+      repositoryRef.current = null;
+      resetUiAfterWipe();
+      setSentinelStatus(`Device wiped in ${elapsed.toFixed(1)} ms`);
+      noteStatus("danger", "Device wiped", "Emergency wipe completed.");
+      window.setTimeout(() => window.location.reload(), 120);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Emergency wipe failed.";
+      setSentinelStatus(message);
+      noteStatus("danger", "Emergency wipe failed", message);
+    }
   }
 
   async function handleManualQuarantineDemo(): Promise<void> {

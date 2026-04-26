@@ -22,12 +22,21 @@ function defaultConfidence(type: MessageType): Confidence {
 export async function createMessage(
   input: CreateMessageInput,
 ): Promise<NexusMessage> {
-  const createdAt = floorToHour(nowUnixSeconds());
+  const createdAtExact = nowUnixSeconds();
+  const createdAt = floorToHour(createdAtExact);
   const ttlHours = input.ttlHours ?? DEFAULT_TTL_HOURS[input.type];
   const ttl = floorToHour(createdAt + ttlHours * 3600);
 
   const topics = [...(input.crucial_topics ?? [])].sort().join("|");
-  const idSource = `${input.type}${createdAt}${input.payload}${topics}`;
+  const idSource = [
+    input.type,
+    createdAtExact,
+    input.priority,
+    input.payload,
+    input.mediaDataUrl ?? "",
+    topics,
+    input.supersedes ?? "",
+  ].join("|");
   const id = await sha256Hex16(idSource);
 
   return {
