@@ -39,6 +39,10 @@ type Section = "relay" | "compose" | "connect";
 type ScannerMode = "snapshot";
 type StatusTone = "ready" | "active" | "warning" | "danger";
 type PeerState = "idle" | "connecting" | "connected" | "disconnected";
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
+};
 type ConnectStep =
   | "pick_role"
   | "initiator_show_code"
@@ -79,6 +83,7 @@ interface DevState {
 }
 
 const SIGNALING_HOST_KEY = "nexus_signaling_host";
+const INSTALL_BANNER_DISMISSED_KEY = "nexus_install_banner_dismissed";
 const DEFAULT_SIGNALING_HOST = "nexus-8nw1.vercel.app";
 const SIGNAL_ROOM_CODE_LENGTH = 6;
 const SIGNAL_ROOM_CODE_PATTERN = new RegExp(
@@ -92,7 +97,11 @@ function classNames(
 }
 
 function pressableCardClasses(base: string): string {
-  return `${base} transition duration-150 active:scale-[0.98] active:shadow-sm`;
+  return `${base} border border-transparent transition duration-150 hover:border-[#c77745] hover:shadow-[0_12px_30px_rgba(16,32,51,0.08)] active:scale-[0.98] active:shadow-sm`;
+}
+
+function fieldClasses(base: string): string {
+  return `${base} transition duration-150 hover:border-[#c77745]`;
 }
 
 function toneClasses(tone: StatusTone): string {
@@ -256,6 +265,10 @@ export function NexusApp() {
   const [networkDraftHost, setNetworkDraftHost] = useState(
     DEFAULT_SIGNALING_HOST,
   );
+  const [installPromptEvent, setInstallPromptEvent] =
+    useState<BeforeInstallPromptEvent | null>(null);
+  const [installBannerVisible, setInstallBannerVisible] = useState(false);
+  const [installing, setInstalling] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [securitySection, setSecuritySection] = useState<
@@ -332,6 +345,55 @@ export function NexusApp() {
       setConnectStatusMessage("");
     }
   }, [section]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const isStandalone =
+      window.matchMedia("(display-mode: standalone)").matches ||
+      window.matchMedia("(display-mode: fullscreen)").matches ||
+      ("standalone" in window.navigator &&
+        Boolean(
+          (
+            window.navigator as Navigator & {
+              standalone?: boolean;
+            }
+          ).standalone,
+        ));
+
+    if (isStandalone) {
+      setInstallBannerVisible(false);
+      return;
+    }
+
+    const dismissed =
+      window.localStorage.getItem(INSTALL_BANNER_DISMISSED_KEY) === "true";
+
+    const handleBeforeInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      if (dismissed) return;
+      setInstallPromptEvent(event as BeforeInstallPromptEvent);
+      setInstallBannerVisible(true);
+    };
+
+    const handleAppInstalled = () => {
+      window.localStorage.setItem(INSTALL_BANNER_DISMISSED_KEY, "true");
+      setInstallPromptEvent(null);
+      setInstallBannerVisible(false);
+      noteStatus("active", "App installed", "Nexus Relay is ready offline.");
+    };
+
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+    window.addEventListener("appinstalled", handleAppInstalled);
+
+    return () => {
+      window.removeEventListener(
+        "beforeinstallprompt",
+        handleBeforeInstallPrompt,
+      );
+      window.removeEventListener("appinstalled", handleAppInstalled);
+    };
+  }, []);
 
   function pushDevLog(tone: StatusTone, title: string, detail: string): void {
     setDevState((current) => ({
@@ -571,6 +633,31 @@ export function NexusApp() {
     setSignalingHost(host);
     setNetworkDraftHost(host);
     setSignalingHostConfirmed(true);
+  }
+
+  function dismissInstallBanner(): void {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(INSTALL_BANNER_DISMISSED_KEY, "true");
+    }
+    setInstallBannerVisible(false);
+  }
+
+  async function handleInstallApp(): Promise<void> {
+    if (!installPromptEvent) return;
+
+    setInstalling(true);
+    try {
+      await installPromptEvent.prompt();
+      const choice = await installPromptEvent.userChoice;
+      if (choice.outcome === "accepted") {
+        setInstallBannerVisible(false);
+      } else {
+        dismissInstallBanner();
+      }
+    } finally {
+      setInstallPromptEvent(null);
+      setInstalling(false);
+    }
   }
 
   useEffect(() => {
@@ -1501,8 +1588,8 @@ export function NexusApp() {
   }
 
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-4 py-4 sm:px-6 sm:py-6">
-      <section className="relative mx-auto w-full max-w-3xl overflow-hidden rounded-[2rem] border border-white/50 bg-[#f6f2e8]/90 p-4 shadow-[0_24px_80px_rgba(16,32,51,0.14)] backdrop-blur sm:p-5">
+    <main className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-4 py-5 sm:px-6 sm:py-8">
+      <section className="relative mx-auto w-full max-w-3xl overflow-hidden rounded-[2rem] border border-white/50 bg-[#f6f2e8]/90 p-5 shadow-[0_24px_80px_rgba(16,32,51,0.14)] backdrop-blur sm:p-6">
         <div className="absolute inset-x-0 top-0 h-28 bg-[radial-gradient(circle_at_top,rgba(227,86,49,0.18),transparent_65%)]" />
 
         <div className="relative">
@@ -1533,23 +1620,44 @@ export function NexusApp() {
             </button>
           </div>
 
-          <div className="mt-5 flex items-center gap-2 rounded-[1.3rem] border border-white/60 bg-white/75 px-4 py-3">
-            <span
-              className={classNames(
-                "h-2.5 w-2.5 rounded-full",
-                statusTone === "active" && "bg-emerald-500",
-                statusTone === "warning" && "bg-amber-500",
-                statusTone === "danger" && "bg-rose-500",
-                statusTone === "ready" && "bg-slate-400",
-              )}
-            />
-            <div className="min-w-0">
-              <p className="truncate text-sm font-semibold text-[#102033]">
-                {statusText}
+          {installBannerVisible && installPromptEvent && (
+            <section className="mt-5 rounded-[1.4rem] border border-[#dfc9b2] bg-white/90 p-5 shadow-[0_12px_30px_rgba(16,32,51,0.08)]">
+              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                Install App
               </p>
-              <p className="truncate text-xs text-[#5a6472]">{syncText}</p>
-            </div>
-          </div>
+              <h2 className="mt-2 text-xl font-semibold text-[#102033]">
+                Save Nexus Relay on this device
+              </h2>
+              <p className="mt-2 text-sm leading-6 text-[#5a6472]">
+                Install the PWA for a full-screen app experience and easier
+                offline access.
+              </p>
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+                <button
+                  type="button"
+                  onClick={() => void handleInstallApp()}
+                  disabled={installing}
+                  className={pressableCardClasses(
+                    classNames(
+                      "rounded-[1.2rem] bg-[#102033] px-5 py-3.5 text-sm font-semibold text-white",
+                      installing && "cursor-wait opacity-80",
+                    ),
+                  )}
+                >
+                  {installing ? "Opening install prompt..." : "Install app"}
+                </button>
+                <button
+                  type="button"
+                  onClick={dismissInstallBanner}
+                  className={pressableCardClasses(
+                    "rounded-[1.2rem] bg-white px-5 py-3.5 text-sm font-medium text-[#102033]",
+                  )}
+                >
+                  Maybe later
+                </button>
+              </div>
+            </section>
+          )}
 
           {storageWarning && (
             <div className="mt-3 rounded-[1.2rem] bg-amber-100 px-4 py-3 text-sm text-amber-900">
@@ -1587,7 +1695,7 @@ export function NexusApp() {
                   type="button"
                   onClick={() => setSharePanelOpen((current) => !current)}
                   className={pressableCardClasses(
-                    "rounded-[1.5rem] bg-[#102033] px-4 py-4 text-left text-white",
+                    "rounded-[1.5rem] bg-[#102033] px-5 py-5 text-left text-white",
                   )}
                 >
                   <span className="block text-xs uppercase tracking-[0.22em] text-white/60">
@@ -1601,7 +1709,7 @@ export function NexusApp() {
                   type="button"
                   onClick={() => openScanner("snapshot")}
                   className={pressableCardClasses(
-                    "rounded-[1.5rem] border border-[#d7cfbe] bg-white/80 px-4 py-4 text-left text-[#102033]",
+                    "rounded-[1.5rem] border border-[#d7cfbe] bg-white/80 px-5 py-5 text-left text-[#102033]",
                   )}
                 >
                   <span className="block text-xs uppercase tracking-[0.22em] text-[#945f3d]">
@@ -1614,7 +1722,7 @@ export function NexusApp() {
               </div>
 
               {sharePanelOpen && (
-                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
+                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
@@ -1642,7 +1750,7 @@ export function NexusApp() {
                         <label
                           key={message.id}
                           className={classNames(
-                            "flex cursor-pointer items-center gap-3 rounded-[1.2rem] border px-3 py-3 transition",
+                            "flex cursor-pointer items-center gap-3 rounded-[1.2rem] border px-4 py-3.5 transition hover:border-[#c77745] hover:shadow-[0_10px_24px_rgba(16,32,51,0.06)]",
                             checked
                               ? "border-[#102033] bg-[#f3eee4]"
                               : "border-[#e4d9c7] bg-white",
@@ -1688,7 +1796,7 @@ export function NexusApp() {
                 </section>
               )}
 
-              <div className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4 text-[#102033]">
+              <div className="rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-5 text-[#102033]">
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <p className="text-xs uppercase tracking-[0.22em] text-[#945f3d]">
@@ -1719,7 +1827,7 @@ export function NexusApp() {
                     type="button"
                     onClick={() => setSelectedMessage(message)}
                     className={pressableCardClasses(
-                      "w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-4 py-4 text-left shadow-[0_10px_24px_rgba(16,32,51,0.06)]",
+                      "w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-5 py-5 text-left shadow-[0_10px_24px_rgba(16,32,51,0.06)]",
                     )}
                   >
                     <div className="flex items-center justify-between gap-3">
@@ -1747,7 +1855,7 @@ export function NexusApp() {
                         )}
                       </div>
                     </div>
-                    <p className="mt-3 text-lg leading-6 font-medium text-[#102033]">
+                    <p className="mt-3 text-lg leading-7 font-normal text-[#102033]">
                       {message.payload}
                     </p>
                     {!!message.crucial_topics?.length && (
@@ -1876,7 +1984,7 @@ export function NexusApp() {
                                 {run.stages.length} steps
                               </span>
                             </div>
-                            <p className="mt-2 text-sm font-medium text-[#102033]">
+                            <p className="mt-2 text-sm font-normal text-[#102033]">
                               {run.summary}
                             </p>
                             <div className="mt-3 flex flex-wrap gap-2">
@@ -1929,7 +2037,7 @@ export function NexusApp() {
 
           {section === "compose" && (
             <section className="mt-6 space-y-4">
-              <div className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
+              <div className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
@@ -1968,7 +2076,7 @@ export function NexusApp() {
                     type="button"
                     onClick={() => setDraftType(type)}
                     className={classNames(
-                      "rounded-[1.1rem] px-3 py-3 text-sm font-medium transition duration-150 active:scale-[0.98]",
+                      "rounded-[1.1rem] px-3 py-3.5 text-sm font-semibold transition duration-150 active:scale-[0.98]",
                       draftType === type
                         ? "bg-[#102033] text-white"
                         : "bg-white text-[#102033]",
@@ -1982,7 +2090,9 @@ export function NexusApp() {
               <textarea
                 value={draftText}
                 onChange={(event) => setDraftText(event.target.value)}
-                className="h-44 w-full rounded-[1.5rem] border border-[#d8d0bf] bg-white px-4 py-4 text-base text-[#102033] outline-none"
+                className={fieldClasses(
+                  "h-44 w-full rounded-[1.5rem] border border-[#d8d0bf] bg-white px-4 py-4 text-base text-[#102033] outline-none",
+                )}
                 placeholder="Road blocked at main gate."
               />
 
@@ -2007,7 +2117,9 @@ export function NexusApp() {
                         key={topic}
                         type="button"
                         onClick={() => addDraftTopic(topic)}
-                        className="rounded-full border border-[#d7cfbe] bg-white px-3 py-1 text-xs font-semibold text-[#102033]"
+                        className={pressableCardClasses(
+                          "rounded-full border border-[#d7cfbe] bg-white px-3 py-1 text-xs font-semibold text-[#102033]",
+                        )}
                       >
                         {topic}
                       </button>
@@ -2025,7 +2137,9 @@ export function NexusApp() {
                       Number(event.target.value) as 1 | 2 | 3 | 4 | 5,
                     )
                   }
-                  className="mt-2 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+                  className={fieldClasses(
+                    "mt-2 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3.5 text-[#102033] outline-none",
+                  )}
                 >
                   <option value={1}>1</option>
                   <option value={2}>2</option>
@@ -2043,14 +2157,18 @@ export function NexusApp() {
                     setDraftSupersedes(undefined);
                     setSection("relay");
                   }}
-                  className="rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]"
+                  className={pressableCardClasses(
+                    "rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
+                  )}
                 >
                   Cancel
                 </button>
                 <button
                   type="button"
                   onClick={() => void handleSaveDraft()}
-                  className="rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white"
+                  className={pressableCardClasses(
+                    "rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
+                  )}
                 >
                   Save Message
                 </button>
@@ -2066,7 +2184,7 @@ export function NexusApp() {
                     type="button"
                     onClick={() => void handleStartInitiator()}
                     className={pressableCardClasses(
-                      "w-full rounded-[1.5rem] bg-[#102033] px-5 py-6 text-left text-white",
+                      "w-full rounded-[1.5rem] bg-[#102033] px-6 py-6 text-left text-white",
                     )}
                   >
                     <span className="block text-2xl font-semibold">Share</span>
@@ -2083,7 +2201,7 @@ export function NexusApp() {
                       setConnectStatusMessage("");
                     }}
                     className={pressableCardClasses(
-                      "w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-5 py-6 text-left text-[#102033]",
+                      "w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-6 py-6 text-left text-[#102033]",
                     )}
                   >
                     <span className="block text-2xl font-semibold">
@@ -2102,13 +2220,13 @@ export function NexusApp() {
                     }}
                     className="text-left text-sm font-semibold text-[#945f3d]"
                   >
-                    Just scan a snapshot QR →
+                    Just scan a snapshot QR {"->"}
                   </button>
                 </>
               )}
 
               {connectStep === "initiator_show_code" && (
-                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
+                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
                   <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
                     Share this room code
                   </h2>
@@ -2145,7 +2263,7 @@ export function NexusApp() {
               )}
 
               {connectStep === "joiner_enter_code" && (
-                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
+                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
                   <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
                     Enter room code
                   </h2>
@@ -2158,7 +2276,9 @@ export function NexusApp() {
                           .slice(0, SIGNAL_ROOM_CODE_LENGTH),
                       )
                     }
-                    className="mt-4 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-center text-3xl tracking-[0.3em] text-[#102033] outline-none"
+                    className={fieldClasses(
+                      "mt-4 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3.5 text-center text-3xl tracking-[0.3em] text-[#102033] outline-none",
+                    )}
                     inputMode="numeric"
                     maxLength={SIGNAL_ROOM_CODE_LENGTH}
                     placeholder="000000"
@@ -2188,13 +2308,13 @@ export function NexusApp() {
                       "mt-4 rounded-full border border-[#d7cfbe] bg-white px-4 py-2 text-sm font-semibold text-[#102033]",
                     )}
                   >
-                    ← Back
+                    {"< Back"}
                   </button>
                 </section>
               )}
 
               {connectStep === "connected" && (
-                <section className="rounded-[1.5rem] border border-emerald-200 bg-emerald-50 p-4">
+                <section className="rounded-[1.5rem] border border-emerald-200 bg-emerald-50 p-5">
                   <p className="text-2xl font-semibold text-emerald-900">
                     Connected
                   </p>
@@ -2225,7 +2345,7 @@ export function NexusApp() {
               )}
 
               {connectStep === "snapshot_scan" && (
-                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
+                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
                   <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
                     Snapshot
                   </p>
@@ -2246,7 +2366,7 @@ export function NexusApp() {
                       "mt-4 rounded-full border border-[#d7cfbe] bg-white px-4 py-2 text-sm font-semibold text-[#102033]",
                     )}
                   >
-                    ← Back
+                    {"< Back"}
                   </button>
                 </section>
               )}
@@ -2265,7 +2385,7 @@ export function NexusApp() {
                   setSection(item);
                 }}
                 className={classNames(
-                  "rounded-[1.1rem] px-3 py-3 text-sm font-medium capitalize transition duration-150 active:scale-[0.98]",
+                  "rounded-[1.1rem] px-3 py-3.5 text-sm font-semibold capitalize transition duration-150 active:scale-[0.98]",
                   section === item
                     ? "bg-[#102033] text-white"
                     : "text-[#5a6472]",

@@ -19,6 +19,14 @@ export const metadata: Metadata = {
   description:
     "Offline-first message bridge with QR snapshots, peer sync, and emergency wipe controls.",
   manifest: "/manifest.json",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "default",
+    title: "Nexus Relay",
+  },
+  icons: {
+    apple: "/icon-192.png",
+  },
 };
 
 export const viewport: Viewport = {

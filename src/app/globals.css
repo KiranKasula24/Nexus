@@ -27,6 +27,7 @@ body {
     linear-gradient(135deg, #fbf4e8 0%, #efe6d7 55%, #e7dccb 100%);
   color: var(--foreground);
   font-family: var(--font-space-grotesk), "Segoe UI", sans-serif;
+  line-height: 1.5;
 }
 
 * {
@@ -51,6 +52,12 @@ button {
     border-color 140ms ease;
 }
 
+button:hover {
+  box-shadow:
+    0 0 0 1px rgba(199, 119, 69, 0.95),
+    0 12px 28px rgba(16, 32, 51, 0.08);
+}
+
 button:active {
   transform: scale(0.98);
 }
@@ -61,6 +68,12 @@ select:focus-visible,
 textarea:focus-visible {
   outline: 2px solid rgba(16, 32, 51, 0.35);
   outline-offset: 2px;
+}
+
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: #c77745;
 }
 
 img {
