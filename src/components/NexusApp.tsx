@@ -834,15 +834,20 @@ export function NexusApp() {
       const state = peer.connection.connectionState;
       if (state === "connecting") {
         setPeerState("connecting");
+        setConnectStatusMessage("Negotiating secure peer link...");
         setSyncText("Connecting phones...");
         noteStatus("warning", "Connecting");
       } else if (state === "connected") {
         setPeerState("connected");
         setConnectStep("connected");
+        setConnectStatusMessage("");
         setSyncText("Phones connected.");
         noteStatus("active", "Connected");
       } else if (state === "disconnected" || state === "failed") {
         setPeerState("disconnected");
+        setConnectStatusMessage(
+          "Peer connection failed. Make a fresh room code and try again.",
+        );
         setSyncText("Connection failed. Try making a new code.");
         noteStatus(
           "danger",
@@ -851,6 +856,7 @@ export function NexusApp() {
         );
       } else if (state === "closed") {
         setPeerState("disconnected");
+        setConnectStatusMessage("Connection closed.");
         setSyncText("Connection closed.");
       }
     };
@@ -874,6 +880,7 @@ export function NexusApp() {
     peer.channel.onopen = () => {
       setPeerState("connected");
       setConnectStep("connected");
+      setConnectStatusMessage("");
       setShowReconnectBanner(false);
       setReconnectRoomCode("");
       clearAnswerPolling();
@@ -1169,9 +1176,8 @@ export function NexusApp() {
         lastAnswerToken: joiner.answerToken,
       }));
 
-      setConnectStatusMessage("Answer sent. Connecting...");
-      setConnectStep("connected");
-      setSyncText("Connection handshake completed. Waiting for WebRTC link.");
+      setConnectStatusMessage("Answer sent. Finalizing peer connection...");
+      setSyncText("Handshake completed. Waiting for WebRTC link.");
       pushDevLog("active", "Joined room", `Submitted answer for room ${room}.`);
     } catch (error) {
       setConnectStatusMessage(

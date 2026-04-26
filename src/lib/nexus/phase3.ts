@@ -87,6 +87,18 @@ export interface PeerArtifacts {
   channel: RTCDataChannel;
 }
 
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+
+function createPeerConnection(): RTCPeerConnection {
+  return new RTCPeerConnection({
+    iceServers: DEFAULT_ICE_SERVERS,
+    iceCandidatePoolSize: 4,
+  });
+}
+
 async function waitForIceGatheringComplete(
   connection: RTCPeerConnection,
 ): Promise<void> {
@@ -110,7 +122,7 @@ export async function createInitiator(): Promise<{
   peer: PeerArtifacts;
   offerToken: string;
 }> {
-  const connection = new RTCPeerConnection({ iceServers: [] });
+  const connection = createPeerConnection();
   const channel = connection.createDataChannel(WEBRTC_CHANNEL_NAME);
 
   const offer = await connection.createOffer();
@@ -126,7 +138,7 @@ export async function createInitiator(): Promise<{
 export async function createJoiner(
   offerToken: string,
 ): Promise<{ peer: PeerArtifacts; answerToken: string }> {
-  const connection = new RTCPeerConnection({ iceServers: [] });
+  const connection = createPeerConnection();
   const offer = decodeWebRtcToken(offerToken);
   const channelPromise = new Promise<RTCDataChannel>((resolve) => {
     connection.ondatachannel = (event) => resolve(event.channel);
