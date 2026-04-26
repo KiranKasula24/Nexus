@@ -14,12 +14,10 @@ import {
   getSignalOffer,
   isValidRoomCode,
   loadPinHash,
-  monitorTripleShake,
   NexusRepository,
   normalizeRoomCode,
   QUARANTINE_KEY,
   publishSignalAnswer,
-  requestMotionPermissionIfNeeded,
   parseCommaSeparatedList,
   normalizeStringList,
   createSignalRoom,
@@ -36,6 +34,7 @@ import {
   setRelayBlockedState,
   startCameraScanner,
   submitPinAttempt,
+  buildSyncShowcase,
   USER_PROFILE_KEY,
   verifyPin,
   waitForSignalAnswer,
@@ -45,6 +44,7 @@ import {
   type NexusMessageWithComputed,
   type PeerArtifacts,
   type PipelineRun,
+  type SyncShowcase,
 } from "@/lib/nexus";
 
 type Section = "relay" | "compose" | "connect";
@@ -82,6 +82,13 @@ interface SyncStats {
   lastNovelCount: number;
   lastSentCount: number;
   lastReceivedCount: number;
+}
+
+interface SyncSessionState {
+  peerProfile?: NexusUserProfile;
+  peerAdvertisedCount: number;
+  senderRun?: PipelineRun;
+  receivedMessages: NexusMessageWithComputed[];
 }
 
 interface DevState {
@@ -268,11 +275,14 @@ export function NexusApp() {
   const syncTimerRef = useRef<number | null>(null);
   const intentionalCloseRef = useRef(false);
   const scannerStopRef = useRef<(() => void) | null>(null);
-  const shakeStopRef = useRef<(() => void) | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const offerPeerRef = useRef<PeerArtifacts | null>(null);
   const joinerPeerRef = useRef<PeerArtifacts | null>(null);
   const handshakeTimeoutRef = useRef<number | null>(null);
+  const syncSessionRef = useRef<SyncSessionState>({
+    peerAdvertisedCount: 0,
+    receivedMessages: [],
+  });
   const handleSyncWireRef = useRef<((raw: string) => Promise<void>) | null>(
     null,
   );
@@ -287,7 +297,7 @@ export function NexusApp() {
     useState<NexusMessageWithComputed | null>(null);
   const [draftText, setDraftText] = useState("");
   const [draftPriority, setDraftPriority] = useState<1 | 2 | 3 | 4 | 5>(4);
-  const [draftType, setDraftType] = useState<MessageType>("text");
+  const [draftType, setDraftType] = useState<MessageType | null>(null);
   const [draftSupersedes, setDraftSupersedes] = useState<string | undefined>();
   const [draftTopicsInput, setDraftTopicsInput] = useState("");
 
@@ -323,12 +333,13 @@ export function NexusApp() {
   const [pinHash, setPinHash] = useState("");
   const [pinLocked, setPinLocked] = useState(false);
   const [sentinelStatus, setSentinelStatus] = useState("Sentinel idle");
-  const [shakeArmed, setShakeArmed] = useState(false);
 
   const developerUnlocked = true;
   const [developerMode, setDeveloperMode] = useState(false);
   const [devPanelOpen, setDevPanelOpen] = useState(false);
   const [devState, setDevState] = useState<DevState>(initialDevState);
+  const [syncShowcase, setSyncShowcase] = useState<SyncShowcase | null>(null);
+  const [syncShowcaseOpen, setSyncShowcaseOpen] = useState(false);
 
   const [scannerMode, setScannerMode] = useState<ScannerMode | null>(null);
   const [connectStep, setConnectStep] = useState<ConnectStep>("pick_role");
@@ -492,12 +503,19 @@ export function NexusApp() {
     await refreshQuarantineCount();
   }
 
+  function resetSyncShowcaseState(): void {
+    syncSessionRef.current = {
+      peerAdvertisedCount: 0,
+      receivedMessages: [],
+    };
+    setSyncShowcase(null);
+    setSyncShowcaseOpen(false);
+  }
+
   function resetUiAfterWipe(): void {
     intentionalCloseRef.current = true;
     scannerStopRef.current?.();
     scannerStopRef.current = null;
-    shakeStopRef.current?.();
-    shakeStopRef.current = null;
     if (syncTimerRef.current) {
       window.clearInterval(syncTimerRef.current);
       syncTimerRef.current = null;
@@ -521,12 +539,12 @@ export function NexusApp() {
     setPinSetup("");
     setPinAttempt("");
     setWipePinInput("");
-    setShakeArmed(false);
     setSettingsOpen(false);
     setSentinelStatus("Device wiped");
     setStatusTone("danger");
     setStatusText("Device wiped");
     setDevState(initialDevState());
+    resetSyncShowcaseState();
     clearPinAttempts();
   }
 
@@ -564,6 +582,7 @@ export function NexusApp() {
     closePeerArtifacts(joinerPeerRef.current);
     offerPeerRef.current = null;
     joinerPeerRef.current = null;
+    resetSyncShowcaseState();
     setConnectStep("pick_role");
     setConnectCodeInput("");
     setPeerState("idle");
@@ -699,7 +718,6 @@ export function NexusApp() {
       stopScoring();
       stopSweep();
       scannerStopRef.current?.();
-      shakeStopRef.current?.();
       if (syncTimerRef.current) {
         window.clearInterval(syncTimerRef.current);
       }
@@ -766,7 +784,7 @@ export function NexusApp() {
     } else {
       setDraftText("");
       setDraftPriority(4);
-      setDraftType("text");
+      setDraftType(null);
       setDraftSupersedes(undefined);
       setDraftTopicsInput((userProfile?.crucialTopics ?? []).join(", "));
     }
@@ -859,7 +877,14 @@ export function NexusApp() {
   }
 
   async function handleSaveDraft(): Promise<void> {
-    if (!repositoryRef.current || !draftText.trim()) {
+    if (!repositoryRef.current) return;
+
+    if (!draftType) {
+      noteStatus("warning", "Choose a message type");
+      return;
+    }
+
+    if (!draftText.trim()) {
       noteStatus("warning", "Message is empty");
       return;
     }
@@ -887,6 +912,7 @@ export function NexusApp() {
     );
 
     setDraftText("");
+    setDraftType(null);
     setDraftSupersedes(undefined);
     setDraftTopicsInput((userProfile?.crucialTopics ?? []).join(", "));
     setSection("relay");
@@ -976,6 +1002,18 @@ export function NexusApp() {
       "Bloom filter exchanged",
       `Advertised ${local.length} known message IDs to the connected peer.`,
     );
+  }
+
+  function openSyncShowcase(): void {
+    const showcase = buildSyncShowcase({
+      localProfile: userProfile ?? undefined,
+      peerProfile: syncSessionRef.current.peerProfile,
+      peerAdvertisedCount: syncSessionRef.current.peerAdvertisedCount,
+      senderRun: syncSessionRef.current.senderRun,
+      receivedMessages: syncSessionRef.current.receivedMessages,
+    });
+    setSyncShowcase(showcase);
+    setSyncShowcaseOpen(true);
   }
 
   async function announceIncomingAlert(
@@ -1134,6 +1172,12 @@ export function NexusApp() {
       );
       const queue = result.messages;
       recordPipelineRun(result.run);
+      syncSessionRef.current = {
+        ...syncSessionRef.current,
+        peerProfile: wire.profile,
+        peerAdvertisedCount: wire.messageCount,
+        senderRun: result.run,
+      };
 
       setDevState((current) => ({
         ...current,
@@ -1169,6 +1213,17 @@ export function NexusApp() {
       if (result.result === "stored") {
         await announceIncomingAlert(result.message);
         await refreshMessages();
+        if (result.message) {
+          syncSessionRef.current = {
+            ...syncSessionRef.current,
+            receivedMessages: [
+              result.message,
+              ...syncSessionRef.current.receivedMessages.filter(
+                (message) => message.id !== result.message?.id,
+              ),
+            ].slice(0, 3),
+          };
+        }
         setDevState((current) => ({
           ...current,
           syncStats: {
@@ -1188,6 +1243,7 @@ export function NexusApp() {
           ? `Connected. Sent ${wire.sentCount} top message${wire.sentCount === 1 ? "" : "s"}.`
           : "Connected. The other phone already has the latest messages.",
       );
+      openSyncShowcase();
     }
   }
 
@@ -1439,28 +1495,6 @@ export function NexusApp() {
     setSentinelStatus(`Device wiped in ${elapsed.toFixed(1)} ms`);
     noteStatus("danger", "Device wiped", "Emergency wipe completed.");
     window.setTimeout(() => window.location.reload(), 120);
-  }
-
-  async function handleToggleShake(): Promise<void> {
-    if (shakeStopRef.current) {
-      shakeStopRef.current();
-      shakeStopRef.current = null;
-      setShakeArmed(false);
-      setSentinelStatus("Triple-shake wipe disarmed");
-      return;
-    }
-
-    const granted = await requestMotionPermissionIfNeeded();
-    if (!granted) {
-      setSentinelStatus("Motion permission denied");
-      return;
-    }
-
-    shakeStopRef.current = monitorTripleShake(() => {
-      void handleEmergencyWipe({ bypassPin: true });
-    });
-    setShakeArmed(true);
-    setSentinelStatus("Triple-shake wipe armed");
   }
 
   async function handleManualQuarantineDemo(): Promise<void> {
@@ -1819,7 +1853,7 @@ export function NexusApp() {
                   </div>
                   <button
                     type="button"
-                    onClick={() => setSection("compose")}
+                    onClick={() => beginCompose()}
                     className={pressableCardClasses(
                       "rounded-full bg-[#102033] px-4 py-2 text-sm font-semibold text-white",
                     )}
@@ -2109,22 +2143,32 @@ export function NexusApp() {
                 </div>
               )}
 
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                {(["text", "alert"] as MessageType[]).map((type) => (
-                  <button
-                    key={type}
-                    type="button"
-                    onClick={() => setDraftType(type)}
-                    className={classNames(
-                      "rounded-[1.1rem] px-3 py-3.5 text-sm font-semibold transition duration-150 active:scale-[0.98]",
-                      draftType === type
-                        ? "bg-[#102033] text-white"
-                        : "bg-white text-[#102033]",
-                    )}
-                  >
-                    {messageLabel(type)}
-                  </button>
-                ))}
+              <div>
+                <p className="text-sm text-[#5a6472]">
+                  Message type is required
+                </p>
+                <div className="mt-3 grid grid-cols-3 gap-2">
+                  {(["text", "alert", "audio"] as MessageType[]).map((type) => (
+                    <button
+                      key={type}
+                      type="button"
+                      onClick={() => setDraftType(type)}
+                      className={classNames(
+                        "rounded-[1.1rem] px-3 py-3.5 text-sm font-semibold transition duration-150 active:scale-[0.98]",
+                        draftType === type
+                          ? "bg-[#102033] text-white"
+                          : "bg-white text-[#102033]",
+                      )}
+                    >
+                      {messageLabel(type)}
+                    </button>
+                  ))}
+                </div>
+                {!draftType && (
+                  <p className="mt-2 text-sm text-amber-900">
+                    Choose whether this is a text update, alert, or audio note before saving.
+                  </p>
+                )}
               </div>
 
               <textarea
@@ -2194,6 +2238,7 @@ export function NexusApp() {
                   type="button"
                   onClick={() => {
                     setDraftText("");
+                    setDraftType(null);
                     setDraftSupersedes(undefined);
                     setSection("relay");
                   }}
@@ -2206,8 +2251,14 @@ export function NexusApp() {
                 <button
                   type="button"
                   onClick={() => void handleSaveDraft()}
+                  disabled={!draftType}
                   className={pressableCardClasses(
-                    "rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
+                    classNames(
+                      "rounded-[1.3rem] px-4 py-4 text-sm font-semibold",
+                      draftType
+                        ? "bg-[#102033] text-white"
+                        : "cursor-not-allowed bg-[#d9d1c4] text-[#786f60]",
+                    ),
                   )}
                 >
                   Save Message
@@ -2387,9 +2438,24 @@ export function NexusApp() {
                   <p className="mt-2 text-sm text-emerald-900">{syncText}</p>
                   <button
                     type="button"
+                    onClick={() => setSyncShowcaseOpen(true)}
+                    disabled={!syncShowcase}
+                    className={pressableCardClasses(
+                      classNames(
+                        "mt-4 w-full rounded-[1.3rem] border border-emerald-300 px-4 py-4 text-sm font-semibold",
+                        syncShowcase
+                          ? "bg-white text-emerald-900"
+                          : "cursor-not-allowed bg-emerald-100 text-emerald-700/70",
+                      ),
+                    )}
+                  >
+                    View Sync Showcase
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setSection("relay")}
                     className={pressableCardClasses(
-                      "mt-4 w-full rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
+                      "mt-3 w-full rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
                     )}
                   >
                     Done
@@ -2447,6 +2513,10 @@ export function NexusApp() {
                 onClick={() => {
                   if (item === "connect") {
                     setConnectStep("pick_role");
+                  }
+                  if (item === "compose") {
+                    beginCompose();
+                    return;
                   }
                   setSection(item);
                 }}
@@ -2636,13 +2706,6 @@ export function NexusApp() {
                 />
                 <button
                   type="button"
-                  onClick={() => void handleToggleShake()}
-                  className="w-full rounded-[1.2rem] bg-[#f3dcbf] px-4 py-3 text-sm font-semibold text-[#6f3f17]"
-                >
-                  {shakeArmed ? "Disarm Triple Shake" : "Arm Triple Shake"}
-                </button>
-                <button
-                  type="button"
                   onClick={() => void handleEmergencyWipe({ pin: wipePinInput })}
                   className="w-full rounded-[1.2rem] bg-[#9f2f24] px-4 py-3 text-sm font-semibold text-white"
                 >
@@ -2784,6 +2847,147 @@ export function NexusApp() {
               Back
             </button>
           </div>
+        </div>
+      )}
+
+      {syncShowcaseOpen && syncShowcase && (
+        <div className="fixed inset-0 z-50 flex items-end bg-[#102033]/50 p-4 sm:items-center sm:justify-center">
+          <section className="w-full max-w-3xl rounded-[2rem] border border-[#d7cfbe] bg-[#f8f4eb] p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                  Sync Showcase
+                </p>
+                <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
+                  Limited-time sync, filtered by the pipeline
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSyncShowcaseOpen(false)}
+                className={pressableCardClasses(
+                  "rounded-full bg-white px-3 py-2 text-sm text-[#102033]",
+                )}
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="mt-5 rounded-[1.5rem] bg-[#102033] px-5 py-5 text-white">
+              <p className="text-sm leading-6 text-white/90">{syncShowcase.summary}</p>
+            </div>
+
+            <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#945f3d]">
+                  Local priorities
+                </p>
+                <p className="mt-2 text-sm text-[#102033]">
+                  {syncShowcase.localPreferences.length > 0
+                    ? syncShowcase.localPreferences.join(", ")
+                    : "No explicit priorities set"}
+                </p>
+              </div>
+              <div className="rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#945f3d]">
+                  Peer priorities
+                </p>
+                <p className="mt-2 text-sm text-[#102033]">
+                  {syncShowcase.peerPreferences.length > 0
+                    ? syncShowcase.peerPreferences.join(", ")
+                    : "Peer shared no explicit priorities"}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <article className="rounded-[1.3rem] bg-white px-4 py-4">
+                <p className="text-xs uppercase tracking-[0.18em] text-[#945f3d]">
+                  Bloom Filter
+                </p>
+                <p className="mt-2 text-2xl font-semibold text-[#102033]">
+                  {Math.max(
+                    0,
+                    syncShowcase.localMessageCount - syncShowcase.novelCandidateCount,
+                  )}
+                </p>
+                <p className="mt-1 text-xs text-[#5a6472]">redundant sends avoided</p>
+              </article>
+              <article className="rounded-[1.3rem] bg-white px-4 py-4">
+                <p className="text-xs uppercase tracking-[0.18em] text-[#945f3d]">
+                  Prioritization Agent
+                </p>
+                <p className="mt-2 text-2xl font-semibold text-[#102033]">
+                  {syncShowcase.prioritizedCount}
+                </p>
+                <p className="mt-1 text-xs text-[#5a6472]">ranked for limited time</p>
+              </article>
+              <article className="rounded-[1.3rem] bg-white px-4 py-4">
+                <p className="text-xs uppercase tracking-[0.18em] text-[#945f3d]">
+                  Relay Gate
+                </p>
+                <p className="mt-2 text-2xl font-semibold text-[#102033]">
+                  {syncShowcase.selectedCount}
+                </p>
+                <p className="mt-1 text-xs text-[#5a6472]">messages allowed through</p>
+              </article>
+              <article className="rounded-[1.3rem] bg-white px-4 py-4">
+                <p className="text-xs uppercase tracking-[0.18em] text-[#945f3d]">
+                  Storage
+                </p>
+                <p className="mt-2 text-2xl font-semibold text-[#102033]">
+                  {syncShowcase.receivedCount}
+                </p>
+                <p className="mt-1 text-xs text-[#5a6472]">new messages stored</p>
+              </article>
+            </div>
+
+            <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#945f3d]">
+                  Pipeline decisions
+                </p>
+                <div className="mt-3 space-y-2 text-sm text-[#102033]">
+                  <p>Peer advertised {syncShowcase.peerAdvertisedCount} known IDs.</p>
+                  <p>Bloom diff kept {syncShowcase.novelCandidateCount} novel candidates from {syncShowcase.localMessageCount} local messages.</p>
+                  <p>Relay Gate dropped {syncShowcase.droppedForFloor} below priority floor and {syncShowcase.droppedForPreference} outside preference matches.</p>
+                </div>
+              </div>
+              <div className="rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#945f3d]">
+                  Shared interests
+                </p>
+                <p className="mt-2 text-sm text-[#102033]">
+                  {syncShowcase.matchedTopics.length > 0
+                    ? syncShowcase.matchedTopics.join(", ")
+                    : "No direct overlap, so the pipeline fell back to message priority."}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#945f3d]">
+                Received preview
+              </p>
+              {syncShowcase.topReceivedMessages.length > 0 ? (
+                <div className="mt-3 space-y-2">
+                  {syncShowcase.topReceivedMessages.map((message) => (
+                    <div
+                      key={message.id}
+                      className="rounded-[1rem] bg-[#f3eee4] px-3 py-3 text-sm text-[#102033]"
+                    >
+                      <span className="font-semibold">{messageLabel(message.type)}:</span>{" "}
+                      {message.payload}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-2 text-sm text-[#5a6472]">
+                  No new inbound messages were stored during this sync cycle.
+                </p>
+              )}
+            </div>
+          </section>
         </div>
       )}
 

@@ -14,4 +14,5 @@ export * from "./repository";
 export * from "./scoring";
 export * from "./sentinel";
 export * from "./signal";
+export * from "./sync-showcase";
 export * from "./types";
