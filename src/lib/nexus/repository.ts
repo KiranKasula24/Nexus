@@ -87,13 +87,17 @@ function withConflictMetadata(
 
 export class NexusRepository {
   private dbPromise: Promise<IDBDatabase | null>;
+  private dbInstance: IDBDatabase | null = null;
   private readonly memory: InMemoryState;
   private usingMemory = false;
 
   constructor(dbName?: string) {
     this.memory = createInMemoryState();
     this.dbPromise = openBridgeDb(dbName ?? "bridge_db")
-      .then((db) => db)
+      .then((db) => {
+        this.dbInstance = db;
+        return db;
+      })
       .catch(() => {
         this.usingMemory = true;
         return null;
@@ -341,6 +345,17 @@ export class NexusRepository {
     }
 
     await clearStores(db, ALL_STORES);
+  }
+
+  async shutdown(): Promise<void> {
+    const db = await this.getDb();
+    if (db) {
+      db.close();
+      this.dbInstance = null;
+    }
+    this.memory.messages.clear();
+    this.memory.systemState.clear();
+    this.memory.encounterLog.clear();
   }
 
   async getSystemState<T = unknown>(key: string): Promise<T | undefined> {

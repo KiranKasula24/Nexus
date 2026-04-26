@@ -1,5 +1,6 @@
 export * from "./constants";
 export * from "./agent-runtime";
+export * from "./audio";
 export * from "./classifier";
 export * from "./db";
 export * from "./phase1";
@@ -12,4 +13,5 @@ export * from "./relay-engine";
 export * from "./repository";
 export * from "./scoring";
 export * from "./sentinel";
+export * from "./signal";
 export * from "./types";

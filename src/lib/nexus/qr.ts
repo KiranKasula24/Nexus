@@ -9,6 +9,7 @@ import type { NexusMessage } from "./types";
 const SNAPSHOT_PREFIX = "S";
 const LIVE_OFFER_PREFIX = "O";
 const LIVE_ANSWER_PREFIX = "A";
+const LIVE_ROOM_PREFIX = "R";
 const WEBRTC_PREFIX = "W";
 const LEGACY_LIVE_PREFIX = "L";
 
@@ -72,12 +73,17 @@ export function buildLiveAnswerPayload(answerToken: string): string {
   return `${LIVE_ANSWER_PREFIX}${answerToken}`;
 }
 
+export function buildLiveRoomPayload(room: string): string {
+  return `${LIVE_ROOM_PREFIX}${room}`;
+}
+
 export function decodeTransportPayload(
   payload: string,
 ):
   | { kind: "snapshot"; messages: NexusMessage[] }
   | { kind: "live_offer"; offer: string }
   | { kind: "live_answer"; answer: string }
+  | { kind: "live_room"; room: string }
   | { kind: "legacy"; url: string } {
   const prefix = payload[0];
   const body = payload.slice(1);
@@ -97,6 +103,10 @@ export function decodeTransportPayload(
 
   if (prefix === LIVE_ANSWER_PREFIX) {
     return { kind: "live_answer", answer: body };
+  }
+
+  if (prefix === LIVE_ROOM_PREFIX) {
+    return { kind: "live_room", room: body };
   }
 
   if (prefix === WEBRTC_PREFIX) {

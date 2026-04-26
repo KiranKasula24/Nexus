@@ -13,6 +13,14 @@ const LEVEL2_ATTEMPTS_KEY = "nexus.level2.pin_attempts";
 const PIN_HASH_KEY = "pin_hash";
 export const SENTINEL_LOCKED_KEY = "sentinel.locked";
 
+export function clearPinAttempts(): void {
+  try {
+    localStorage.removeItem(LEVEL2_ATTEMPTS_KEY);
+  } catch {
+    // Ignore unavailable storage contexts.
+  }
+}
+
 function accelerationMagnitude(event: DeviceMotionEvent): number {
   const x = event.accelerationIncludingGravity?.x ?? 0;
   const y = event.accelerationIncludingGravity?.y ?? 0;
@@ -42,6 +50,7 @@ export async function savePinHash(
 ): Promise<string> {
   const hash = await hashPin(pin);
   await repository.setSystemState(PIN_HASH_KEY, hash);
+  clearPinAttempts();
   return hash;
 }
 
@@ -82,7 +91,7 @@ export async function runLevel2Wipe(
     .map((message) => message.id);
 
   await repository.deleteByIds(ids);
-  setAttempts(0);
+  clearPinAttempts();
   return { deleted: ids.length };
 }
 
@@ -98,7 +107,7 @@ export async function submitPinAttempt(
 }> {
   const ok = await verifyPin(pin, pinHash);
   if (ok) {
-    setAttempts(0);
+    clearPinAttempts();
     return {
       ok: true,
       attemptsLeft: LEVEL2_MAX_PIN_ATTEMPTS,
@@ -128,6 +137,7 @@ export async function runLevel3Wipe(
 ): Promise<number> {
   const start = performance.now();
   await repository.clearAllStores();
+  await repository.shutdown();
 
   try {
     localStorage.clear();
@@ -139,6 +149,11 @@ export async function runLevel3Wipe(
   if (typeof caches !== "undefined") {
     const keys = await caches.keys();
     await Promise.all(keys.map((key) => caches.delete(key)));
+  }
+
+  if ("serviceWorker" in navigator) {
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
   }
 
   await deleteBridgeDb();

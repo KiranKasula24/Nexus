@@ -4,20 +4,26 @@ import Image from "next/image";
 import QRCode from "qrcode";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  buildLiveAnswerPayload,
-  buildLiveOfferPayload,
   buildBloomFromMessages,
+  buildLiveRoomPayload,
   createInitiator,
   createJoiner,
   decodeTransportPayload,
+  enqueueBroadcastMessage,
   finalizeInitiator,
+  getSignalOffer,
+  isValidRoomCode,
   loadPinHash,
   monitorTripleShake,
   NexusRepository,
+  normalizeRoomCode,
   QUARANTINE_KEY,
+  publishSignalAnswer,
   requestMotionPermissionIfNeeded,
   parseCommaSeparatedList,
   normalizeStringList,
+  createSignalRoom,
+  clearPinAttempts,
   runComposePipeline,
   runLevel3Wipe,
   runPeerReceivePipeline,
@@ -31,6 +37,8 @@ import {
   startCameraScanner,
   submitPinAttempt,
   USER_PROFILE_KEY,
+  verifyPin,
+  waitForSignalAnswer,
   type NexusUserProfile,
   type MessageType,
   type NexusMessage,
@@ -49,10 +57,8 @@ type BeforeInstallPromptEvent = Event & {
 };
 type ConnectStep =
   | "pick_role"
-  | "initiator_show_offer"
-  | "initiator_scan_answer"
-  | "joiner_scan_offer"
-  | "joiner_show_answer"
+  | "initiator_wait_connect"
+  | "joiner_enter_code"
   | "connected"
   | "snapshot_scan";
 type SyncWire =
@@ -83,13 +89,25 @@ interface DevState {
   runs: PipelineRun[];
   lastSnapshotPayload: string;
   lastOfferToken: string;
-  lastAnswerToken: string;
+  lastRoomCode: string;
   quarantineCount: number;
   syncStats: SyncStats;
 }
 
 const INSTALL_BANNER_DISMISSED_KEY = "nexus_install_banner_dismissed";
 const HANDSHAKE_TIMEOUT_MS = 90_000;
+const PREFERENCE_OPTIONS = [
+  "water",
+  "food",
+  "shelter",
+  "medicine",
+  "evacuation",
+  "safety",
+  "power",
+  "transport",
+  "family",
+  "weather",
+] as const;
 
 function classNames(
   ...parts: Array<string | false | null | undefined>
@@ -193,7 +211,7 @@ function initialDevState(): DevState {
     runs: [],
     lastSnapshotPayload: "",
     lastOfferToken: "",
-    lastAnswerToken: "",
+    lastRoomCode: "",
     quarantineCount: 0,
     syncStats: {
       lastNovelCount: 0,
@@ -219,6 +237,29 @@ function toRawMessage(message: NexusMessageWithComputed): NexusMessage {
     superseded_by: message.superseded_by,
     schema_version: message.schema_version,
   };
+}
+
+function splitPreferences(values: string[]): {
+  selected: string[];
+  custom: string[];
+} {
+  const presetSet = new Set<string>(PREFERENCE_OPTIONS);
+  const selected: string[] = [];
+  const custom: string[] = [];
+
+  for (const value of normalizeStringList(values)) {
+    if (presetSet.has(value as (typeof PREFERENCE_OPTIONS)[number])) {
+      selected.push(value);
+    } else {
+      custom.push(value);
+    }
+  }
+
+  return { selected, custom };
+}
+
+function normalizePinInput(value: string): string {
+  return value.replace(/\D/g, "").slice(0, 6);
 }
 
 export function NexusApp() {
@@ -252,6 +293,7 @@ export function NexusApp() {
 
   const [userProfile, setUserProfile] = useState<NexusUserProfile | null>(null);
   const [profileSetupOpen, setProfileSetupOpen] = useState(false);
+  const [selectedPreferences, setSelectedPreferences] = useState<string[]>([]);
   const [profilePrefsInput, setProfilePrefsInput] = useState("");
   const [profileRequirementsInput, setProfileRequirementsInput] = useState("");
   const [profileTopicsInput, setProfileTopicsInput] = useState("");
@@ -275,8 +317,9 @@ export function NexusApp() {
   const [securitySection, setSecuritySection] = useState<
     "security" | "emergency" | "developer" | "profile"
   >("security");
-  const [pinSetup, setPinSetup] = useState("123456");
-  const [pinAttempt, setPinAttempt] = useState("123456");
+  const [pinSetup, setPinSetup] = useState("");
+  const [pinAttempt, setPinAttempt] = useState("");
+  const [wipePinInput, setWipePinInput] = useState("");
   const [pinHash, setPinHash] = useState("");
   const [pinLocked, setPinLocked] = useState(false);
   const [sentinelStatus, setSentinelStatus] = useState("Sentinel idle");
@@ -293,6 +336,7 @@ export function NexusApp() {
   const [connectHint, setConnectHint] = useState(
     "Both phones should stay on the same hotspot or Wi-Fi.",
   );
+  const [connectCodeInput, setConnectCodeInput] = useState("");
   const [snapshotQrUrl, setSnapshotQrUrl] = useState("");
   const [snapshotQrTitle, setSnapshotQrTitle] = useState("");
   const [snapshotQrDetail, setSnapshotQrDetail] = useState("");
@@ -448,6 +492,44 @@ export function NexusApp() {
     await refreshQuarantineCount();
   }
 
+  function resetUiAfterWipe(): void {
+    intentionalCloseRef.current = true;
+    scannerStopRef.current?.();
+    scannerStopRef.current = null;
+    shakeStopRef.current?.();
+    shakeStopRef.current = null;
+    if (syncTimerRef.current) {
+      window.clearInterval(syncTimerRef.current);
+      syncTimerRef.current = null;
+    }
+    syncChannelRef.current?.close();
+    resetNearbyFlow({ preserveStatus: true });
+    setMessages([]);
+    setSelectedMessage(null);
+    setSelectedShareIds([]);
+    setSharePanelOpen(false);
+    setUserProfile(null);
+    setProfileSetupOpen(true);
+    setSelectedPreferences([]);
+    setProfilePrefsInput("");
+    setProfileRequirementsInput("");
+    setProfileTopicsInput("");
+    setDraftText("");
+    setDraftTopicsInput("");
+    setPinHash("");
+    setPinLocked(false);
+    setPinSetup("");
+    setPinAttempt("");
+    setWipePinInput("");
+    setShakeArmed(false);
+    setSettingsOpen(false);
+    setSentinelStatus("Device wiped");
+    setStatusTone("danger");
+    setStatusText("Device wiped");
+    setDevState(initialDevState());
+    clearPinAttempts();
+  }
+
   function noteStatus(tone: StatusTone, label: string, detail?: string): void {
     setStatusTone(tone);
     setStatusText(label);
@@ -483,6 +565,7 @@ export function NexusApp() {
     offerPeerRef.current = null;
     joinerPeerRef.current = null;
     setConnectStep("pick_role");
+    setConnectCodeInput("");
     setPeerState("idle");
     setConnectHint("Both phones should stay on the same hotspot or Wi-Fi.");
     if (!options?.preserveStatus) {
@@ -520,22 +603,12 @@ export function NexusApp() {
   }
 
   async function revealCurrentOfferQr(): Promise<void> {
-    if (!devState.lastOfferToken) return;
+    if (!devState.lastRoomCode) return;
     await showTransportQr(
-      "Live Sync Offer",
-      "Phone 2 should scan this QR to prepare the direct nearby link. After that, scan the answer QR back on this phone.",
-      buildLiveOfferPayload(devState.lastOfferToken),
-      formatRelativeTone("warning", "Step 1 of 2"),
-    );
-  }
-
-  async function revealCurrentAnswerQr(): Promise<void> {
-    if (!devState.lastAnswerToken) return;
-    await showTransportQr(
-      "Live Sync Answer",
-      "Phone 1 should scan this answer QR to complete the nearby live link.",
-      buildLiveAnswerPayload(devState.lastAnswerToken),
-      formatRelativeTone("warning", "Step 2 of 2"),
+      "Live Sync Code",
+      `Phone 2 can scan this QR or enter code ${devState.lastRoomCode}. The link will finish automatically.`,
+      buildLiveRoomPayload(devState.lastRoomCode),
+      formatRelativeTone("warning", `Code ${devState.lastRoomCode}`),
     );
   }
 
@@ -574,25 +647,31 @@ export function NexusApp() {
       const storedProfile =
         await repository.getSystemState<NexusUserProfile>(USER_PROFILE_KEY);
       if (storedProfile) {
+        const { selected, custom } = splitPreferences(storedProfile.preferences);
         setUserProfile(storedProfile);
-        setProfilePrefsInput(storedProfile.preferences.join(", "));
+        setSelectedPreferences(selected);
+        setProfilePrefsInput(custom.join(", "));
         setProfileRequirementsInput(storedProfile.requirements);
         setProfileTopicsInput(storedProfile.crucialTopics.join(", "));
         setDraftTopicsInput(storedProfile.crucialTopics.join(", "));
       } else {
-        setProfileSetupOpen(true);
         setStatusTone("warning");
-        setStatusText("Set profile to start smart sync");
+        setStatusText("Complete setup to start smart sync");
       }
 
       const storedPinHash = await loadPinHash(repository);
       if (storedPinHash) {
         setPinHash(storedPinHash);
         setPinLocked(true);
+        setPinSetup("");
+        setPinAttempt("");
         await setRelayBlockedState(repository, true);
       } else {
+        setPinHash("");
         await setRelayBlockedState(repository, false);
       }
+
+      setProfileSetupOpen(!storedProfile || !storedPinHash);
 
       if (await repository.isUsingMemoryStorage()) {
         setStorageWarning(
@@ -700,10 +779,21 @@ export function NexusApp() {
     setDraftTopicsInput(next.join(", "));
   }
 
-  async function handleSaveProfile(): Promise<void> {
-    if (!repositoryRef.current) return;
+  function togglePreferenceOption(option: string): void {
+    setSelectedPreferences((current) =>
+      current.includes(option)
+        ? current.filter((value) => value !== option)
+        : [...current, option],
+    );
+  }
 
-    const preferences = parseCommaSeparatedList(profilePrefsInput);
+  async function handleSaveProfile(closeSetup = true): Promise<boolean> {
+    if (!repositoryRef.current) return false;
+
+    const preferences = normalizeStringList([
+      ...selectedPreferences,
+      ...parseCommaSeparatedList(profilePrefsInput),
+    ]);
     const crucialTopics = parseCommaSeparatedList(profileTopicsInput);
     const requirements = profileRequirementsInput.trim();
 
@@ -717,7 +807,7 @@ export function NexusApp() {
         "Set at least one preference",
         "Add preferences, requirements, or crucial topics before continuing.",
       );
-      return;
+      return false;
     }
 
     const now = Date.now();
@@ -731,12 +821,41 @@ export function NexusApp() {
 
     await repositoryRef.current.setSystemState(USER_PROFILE_KEY, nextProfile);
     setUserProfile(nextProfile);
-    setProfileSetupOpen(false);
+    if (closeSetup) {
+      setProfileSetupOpen(false);
+    }
     noteStatus(
       "active",
       "Profile saved",
       "Preferences and requirements are now used for hotspot and QR sharing.",
     );
+    return true;
+  }
+
+  async function handleCompleteInitialSetup(): Promise<void> {
+    if (!repositoryRef.current) return;
+
+    const savedProfile = await handleSaveProfile(false);
+    if (!savedProfile) {
+      return;
+    }
+
+    if (!pinHash) {
+      try {
+        const hash = await savePinHash(repositoryRef.current, pinSetup);
+        setPinHash(hash);
+        setPinSetup("");
+      } catch (error) {
+        setSentinelStatus(
+          error instanceof Error ? error.message : "Failed to save PIN",
+        );
+        return;
+      }
+    }
+
+    setProfileSetupOpen(false);
+    setSentinelStatus("Setup complete");
+    noteStatus("active", "Setup complete", "Profile and PIN are ready.");
   }
 
   async function handleSaveDraft(): Promise<void> {
@@ -857,6 +976,24 @@ export function NexusApp() {
       "Bloom filter exchanged",
       `Advertised ${local.length} known message IDs to the connected peer.`,
     );
+  }
+
+  async function announceIncomingAlert(
+    message?: NexusMessageWithComputed,
+  ): Promise<void> {
+    if (!message || message.type !== "alert") return;
+
+    try {
+      await enqueueBroadcastMessage(toRawMessage(message));
+    } catch (error) {
+      pushDevLog(
+        "warning",
+        "Alert audio unavailable",
+        error instanceof Error
+          ? error.message
+          : "Could not speak the received alert aloud.",
+      );
+    }
   }
 
   async function attachPeer(
@@ -1030,6 +1167,7 @@ export function NexusApp() {
       recordPipelineRun(result.run);
 
       if (result.result === "stored") {
+        await announceIncomingAlert(result.message);
         await refreshMessages();
         setDevState((current) => ({
           ...current,
@@ -1053,6 +1191,39 @@ export function NexusApp() {
     }
   }
 
+  async function finalizeInitiatorFromRoom(room: string): Promise<void> {
+    if (!offerPeerRef.current) {
+      throw new Error("Live sync is no longer waiting on this phone.");
+    }
+
+    setConnectStatusMessage("Receiver joined. Finalizing nearby link...");
+    const answerToken = await waitForSignalAnswer(room, HANDSHAKE_TIMEOUT_MS);
+    await finalizeInitiator(offerPeerRef.current.connection, answerToken);
+    setConnectHint("Connection is being finalized directly between both phones.");
+    hideSnapshotQr();
+  }
+
+  async function joinRoomCode(room: string): Promise<void> {
+    if (!isValidRoomCode(room)) {
+      throw new Error("Connection code must be 6 digits.");
+    }
+
+    setConnectStatusMessage("Code received. Fetching the sender offer...");
+    setConnectHint("Keep both phones on the same hotspot or Wi-Fi during setup.");
+    const offerToken = await getSignalOffer(room);
+    const joiner = await createJoiner(offerToken);
+    await attachPeer(joiner.peer, "joiner");
+    await publishSignalAnswer(room, joiner.answerToken);
+    setConnectCodeInput(room);
+    setConnectStatusMessage("Connection request sent. Waiting for the sender to finish.");
+    setConnectHint("The nearby link should connect in a moment.");
+    noteStatus(
+      "active",
+      "Connection code accepted",
+      `Joined live sync room ${room}.`,
+    );
+  }
+
   async function handleScannedPayload(decoded: string): Promise<void> {
     if (!repositoryRef.current) return;
 
@@ -1065,6 +1236,11 @@ export function NexusApp() {
           decoded,
         );
         recordPipelineRun(result.run);
+        for (const entry of result.results) {
+          if (entry.status !== "stored" || !entry.messageId) continue;
+          const storedMessage = await repositoryRef.current.getById(entry.messageId);
+          await announceIncomingAlert(storedMessage);
+        }
         await refreshMessages();
         noteStatus(
           result.stored > 0 ? "active" : "warning",
@@ -1076,56 +1252,30 @@ export function NexusApp() {
         return;
       }
 
-      if (payload.kind === "live_offer") {
-        if (connectStep !== "joiner_scan_offer") {
+      if (payload.kind === "live_room") {
+        if (connectStep !== "joiner_enter_code") {
           noteStatus(
             "warning",
-            "This QR starts live sync",
+            "This QR contains a live sync code",
             "Use it from Receive Live Sync on the second phone.",
           );
           return;
         }
 
-        setConnectStatusMessage("Offer scanned. Creating local answer...");
-        setConnectHint("Keep this answer QR visible while the first phone scans it.");
-        const joiner = await createJoiner(payload.offer);
-        await attachPeer(joiner.peer, "joiner");
-        const answerPayload = buildLiveAnswerPayload(joiner.answerToken);
-
-        setDevState((current) => ({
-          ...current,
-          lastAnswerToken: joiner.answerToken,
-        }));
-
-        setConnectStep("joiner_show_answer");
-        setConnectStatusMessage("Show this answer QR to the first phone.");
-        await showTransportQr(
-          "Live Sync Answer",
-          "Phone 1 should scan this answer QR to complete the nearby live link.",
-          answerPayload,
-          formatRelativeTone("warning", "Step 2 of 2"),
-        );
-        beginHandshakeTimeout(
-          "Timed out waiting for the first phone to scan the answer QR.",
-        );
+        setConnectCodeInput(payload.room);
+        await joinRoomCode(payload.room);
         return;
       }
 
-      if (payload.kind === "live_answer") {
-        if (connectStep !== "initiator_scan_answer" || !offerPeerRef.current) {
+      if (payload.kind === "live_offer" || payload.kind === "live_answer") {
+        if (connectStep !== "joiner_enter_code") {
           noteStatus(
             "warning",
-            "This QR completes live sync",
-            "Start on the first phone and scan the answer from there.",
+            "Use the new live sync code flow",
+            "Ask the sender for the current code or room QR and try again.",
           );
           return;
         }
-
-        setConnectStatusMessage("Answer scanned. Finalizing local peer link...");
-        await finalizeInitiator(offerPeerRef.current.connection, payload.answer);
-        setConnectHint("Connection is being finalized directly between both phones.");
-        hideSnapshotQr();
-        return;
       }
 
       noteStatus("warning", "Unsupported QR payload kind");
@@ -1134,7 +1284,10 @@ export function NexusApp() {
         "danger",
         error instanceof Error ? error.message : "Could not decode QR",
       );
-      if (connectStep === "joiner_scan_offer" || connectStep === "initiator_scan_answer") {
+      if (
+        connectStep === "joiner_enter_code" ||
+        connectStep === "initiator_wait_connect"
+      ) {
         setConnectStatusMessage(
           error instanceof Error ? error.message : "Could not decode QR",
         );
@@ -1146,35 +1299,51 @@ export function NexusApp() {
     try {
       resetNearbyFlow({ preserveStatus: true });
       hideSnapshotQr();
-      setConnectStatusMessage("Creating local-only live sync offer...");
-      setConnectHint("Phone 2 should scan this QR while both phones stay on the same hotspot or Wi-Fi.");
-      setConnectStep("initiator_show_offer");
+      setConnectStatusMessage("Creating nearby connection code...");
+      setConnectHint("Phone 2 can scan your QR or type your 6-digit code.");
+      setConnectStep("initiator_wait_connect");
       setSection("connect");
 
       const result = await createInitiator();
       await attachPeer(result.peer, "initiator");
+      const room = await createSignalRoom(result.offerToken);
 
       setDevState((current) => ({
         ...current,
         lastOfferToken: result.offerToken,
+        lastRoomCode: room.room,
       }));
 
       await showTransportQr(
-        "Live Sync Offer",
-        "Phone 2 should scan this QR to prepare the direct nearby link. After that, scan the answer QR back on this phone.",
-        buildLiveOfferPayload(result.offerToken),
-        formatRelativeTone("warning", "Step 1 of 2"),
+        "Live Sync Code",
+        `Phone 2 can scan this QR or enter code ${room.room}. The connection will finish automatically.`,
+        buildLiveRoomPayload(room.room),
+        formatRelativeTone("warning", `Code ${room.room}`),
       );
-      setConnectStep("initiator_scan_answer");
-      setConnectStatusMessage("Waiting for the second phone to scan and return an answer QR.");
-      setSyncText("Live sync bootstrap is ready.");
-      beginHandshakeTimeout(
-        "Timed out waiting for the second phone to return an answer QR.",
-      );
+      setConnectStatusMessage(`Waiting for the receiver to use code ${room.room}.`);
+      setSyncText("Live sync code is ready.");
+      void finalizeInitiatorFromRoom(room.room).catch((error: unknown) => {
+        if (intentionalCloseRef.current) {
+          return;
+        }
+        resetNearbyFlow({ preserveStatus: true });
+        setConnectStatusMessage(
+          error instanceof Error
+            ? error.message
+            : "Unable to finish the nearby connection.",
+        );
+        noteStatus(
+          "danger",
+          "Connection setup failed",
+          error instanceof Error
+            ? error.message
+            : "Unable to finish the nearby connection.",
+        );
+      });
       pushDevLog(
         "active",
-        "Offer QR ready",
-        "Prepared a local-only live sync offer QR for the second phone.",
+        "Connection code ready",
+        `Prepared live sync room ${room.room} for the second phone.`,
       );
     } catch (error) {
       resetNearbyFlow({ preserveStatus: true });
@@ -1194,11 +1363,10 @@ export function NexusApp() {
   function handleStartJoiner(): void {
     resetNearbyFlow({ preserveStatus: true });
     hideSnapshotQr();
-    setConnectStep("joiner_scan_offer");
-    setConnectStatusMessage("Scan the offer QR from the first phone.");
-    setConnectHint("Keep both phones on the same hotspot or Wi-Fi during the whole handshake.");
+    setConnectStep("joiner_enter_code");
+    setConnectStatusMessage("Scan the sender QR or type the 6-digit code.");
+    setConnectHint("Keep both phones on the same hotspot or Wi-Fi during setup.");
     setSection("connect");
-    openScanner("snapshot");
   }
 
   async function handleSavePin(): Promise<void> {
@@ -1207,6 +1375,7 @@ export function NexusApp() {
     try {
       const hash = await savePinHash(repositoryRef.current, pinSetup);
       setPinHash(hash);
+      setPinSetup("");
       await applyRelayBlockedState(false);
       setSentinelStatus("PIN saved");
       noteStatus("ready", "PIN updated");
@@ -1250,9 +1419,23 @@ export function NexusApp() {
     setSentinelStatus(`Wrong PIN. ${result.attemptsLeft} attempt(s) left.`);
   }
 
-  async function handleEmergencyWipe(): Promise<void> {
+  async function handleEmergencyWipe(options?: {
+    bypassPin?: boolean;
+    pin?: string;
+  }): Promise<void> {
     if (!repositoryRef.current) return;
+    if (pinHash && !options?.bypassPin) {
+      const enteredPin = options?.pin?.trim() ?? "";
+      const valid = await verifyPin(enteredPin, pinHash);
+
+      if (!valid) {
+        setSentinelStatus("Enter the correct PIN to confirm wipe.");
+        return;
+      }
+    }
+
     const elapsed = await runLevel3Wipe(repositoryRef.current);
+    resetUiAfterWipe();
     setSentinelStatus(`Device wiped in ${elapsed.toFixed(1)} ms`);
     noteStatus("danger", "Device wiped", "Emergency wipe completed.");
     window.setTimeout(() => window.location.reload(), 120);
@@ -1274,7 +1457,7 @@ export function NexusApp() {
     }
 
     shakeStopRef.current = monitorTripleShake(() => {
-      void handleEmergencyWipe();
+      void handleEmergencyWipe({ bypassPin: true });
     });
     setShakeArmed(true);
     setSentinelStatus("Triple-shake wipe armed");
@@ -1324,15 +1507,40 @@ export function NexusApp() {
           </h2>
           <p className="mt-2 text-sm text-[#5a6472]">
             These preferences and requirements are exchanged during hotspot
-            pairing and used to prioritize what data is sent first.
+            pairing and used to prioritize what data is sent first. Set a PIN
+            now so wipe and unlock controls are ready on this device.
           </p>
 
           <div className="mt-4 space-y-3">
+            <div>
+              <p className="text-sm text-[#5a6472]">
+                Pick what this device should prioritize
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {PREFERENCE_OPTIONS.map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    onClick={() => togglePreferenceOption(option)}
+                    className={pressableCardClasses(
+                      classNames(
+                        "rounded-full px-3 py-2 text-sm font-semibold capitalize",
+                        selectedPreferences.includes(option)
+                          ? "bg-[#102033] text-white"
+                          : "bg-white text-[#102033]",
+                      ),
+                    )}
+                  >
+                    {option}
+                  </button>
+                ))}
+              </div>
+            </div>
             <input
               value={profilePrefsInput}
               onChange={(event) => setProfilePrefsInput(event.target.value)}
               className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
-              placeholder="Preferences (comma separated): water, medicine"
+              placeholder="More preferences (optional): insulin, baby formula"
             />
             <textarea
               value={profileRequirementsInput}
@@ -1348,11 +1556,18 @@ export function NexusApp() {
               className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
               placeholder="Default crucial topics for your messages"
             />
+            <input
+              value={pinSetup}
+              onChange={(event) => setPinSetup(normalizePinInput(event.target.value))}
+              className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+              inputMode="numeric"
+              placeholder="Create 6-digit PIN"
+            />
           </div>
 
           <button
             type="button"
-            onClick={() => void handleSaveProfile()}
+            onClick={() => void handleCompleteInitialSetup()}
             className="mt-4 w-full rounded-[1.2rem] bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
           >
             Continue
@@ -1377,10 +1592,12 @@ export function NexusApp() {
           </p>
           <input
             value={pinAttempt}
-            onChange={(event) => setPinAttempt(event.target.value)}
+            onChange={(event) =>
+              setPinAttempt(normalizePinInput(event.target.value))
+            }
             className="mt-6 w-full rounded-2xl border border-[#d8d0bf] bg-white px-4 py-3 text-lg tracking-[0.3em] text-[#102033] outline-none"
             inputMode="numeric"
-            placeholder="123456"
+            placeholder="Enter 6-digit PIN"
           />
           <button
             type="button"
@@ -1391,7 +1608,7 @@ export function NexusApp() {
           </button>
           <button
             type="button"
-            onClick={() => void handleEmergencyWipe()}
+            onClick={() => void handleEmergencyWipe({ pin: pinAttempt })}
             className="mt-3 w-full rounded-2xl bg-[#9f2f24] px-4 py-3 text-sm font-semibold text-white"
           >
             Emergency Wipe
@@ -1746,10 +1963,10 @@ export function NexusApp() {
                           snapshot: {devState.lastSnapshotPayload || "none"}
                         </p>
                         <p className="mt-2 break-all font-mono text-xs">
-                          first: {devState.lastOfferToken || "none"}
+                          offer: {devState.lastOfferToken || "none"}
                         </p>
                         <p className="mt-2 break-all font-mono text-xs">
-                          second: {devState.lastAnswerToken || "none"}
+                          room: {devState.lastRoomCode || "none"}
                         </p>
                       </div>
 
@@ -2014,7 +2231,7 @@ export function NexusApp() {
                       Live Sync Nearby
                     </span>
                     <span className="mt-2 block text-sm text-white/70">
-                      Show an offer QR, then scan the answer QR back on this phone
+                      Show one QR or one 6-digit code for the receiver
                     </span>
                   </button>
 
@@ -2029,7 +2246,7 @@ export function NexusApp() {
                       Receive Live Sync
                     </span>
                     <span className="mt-2 block text-sm text-[#5a6472]">
-                      Scan the offer QR from the first phone
+                      Scan the sender QR or enter the 6-digit code
                     </span>
                   </button>
 
@@ -2046,22 +2263,28 @@ export function NexusApp() {
                 </>
               )}
 
-              {(connectStep === "initiator_show_offer" ||
-                connectStep === "initiator_scan_answer") && (
+              {connectStep === "initiator_wait_connect" && (
                 <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
                   <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
                     Live Sync
                   </p>
                   <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                    Start the nearby link
+                    Share this code
                   </h2>
                   <p className="mt-4 text-sm text-[#5a6472]">
                     {connectHint}
                   </p>
                   <p className="mt-2 text-sm font-semibold text-[#102033]">
-                    {connectStatusMessage ||
-                      "Share the offer QR, then scan the answer QR back on this phone."}
+                    {connectStatusMessage || "Waiting for the receiver to join."}
                   </p>
+                  <div className="mt-5 rounded-[1.4rem] bg-[#102033] px-4 py-5 text-center text-white">
+                    <p className="text-xs uppercase tracking-[0.18em] text-white/60">
+                      Connection code
+                    </p>
+                    <p className="mt-2 text-4xl font-semibold tracking-[0.28em]">
+                      {devState.lastRoomCode || "......"}
+                    </p>
+                  </div>
                   <div className="mt-5 grid gap-3 sm:grid-cols-2">
                     <button
                       type="button"
@@ -2070,22 +2293,11 @@ export function NexusApp() {
                         "rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
                       )}
                     >
-                      Show Offer QR
+                      Show QR
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        hideSnapshotQr();
-                        setConnectStep("joiner_scan_offer");
-                        setConnectStatusMessage("Scan the offer QR from the first phone.");
-                        openScanner("snapshot");
-                      }}
-                      className={pressableCardClasses(
-                        "rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
-                      )}
-                    >
-                      Scan Answer QR
-                    </button>
+                    <div className="rounded-[1.3rem] border border-dashed border-[#d7cfbe] px-4 py-4 text-sm text-[#5a6472]">
+                      The receiver only needs this one code.
+                    </div>
                   </div>
                   <button
                     type="button"
@@ -2102,27 +2314,55 @@ export function NexusApp() {
                 </section>
               )}
 
-              {connectStep === "joiner_scan_offer" && (
+              {connectStep === "joiner_enter_code" && (
                 <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
                   <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
                     Live Sync
                   </p>
                   <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                    Scan the first phone
+                    Join with code or QR
                   </h2>
                   <p className="mt-3 text-sm text-[#5a6472]">{connectHint}</p>
                   <p className="mt-4 text-sm font-semibold text-[#102033]">
                     {connectStatusMessage}
                   </p>
-                  <button
-                    type="button"
-                    onClick={() => openScanner("snapshot")}
-                    className={pressableCardClasses(
-                      "mt-4 w-full rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
+                  <input
+                    value={connectCodeInput}
+                    onChange={(event) =>
+                      setConnectCodeInput(normalizeRoomCode(event.target.value))
+                    }
+                    inputMode="numeric"
+                    placeholder="Enter 6-digit code"
+                    className={fieldClasses(
+                      "mt-4 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-center text-2xl tracking-[0.32em] text-[#102033] outline-none",
                     )}
-                  >
-                    Scan Offer QR
-                  </button>
+                  />
+                  <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                    <button
+                      type="button"
+                      onClick={() => void joinRoomCode(connectCodeInput)}
+                      disabled={!isValidRoomCode(connectCodeInput)}
+                      className={pressableCardClasses(
+                        classNames(
+                          "rounded-[1.3rem] px-4 py-4 text-sm font-semibold",
+                          isValidRoomCode(connectCodeInput)
+                            ? "bg-[#102033] text-white"
+                            : "cursor-not-allowed bg-[#d9d1c4] text-[#786f60]",
+                        ),
+                      )}
+                    >
+                      Join with Code
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openScanner("snapshot")}
+                      className={pressableCardClasses(
+                        "rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
+                      )}
+                    >
+                      Scan QR Instead
+                    </button>
+                  </div>
                   <button
                     type="button"
                     onClick={() => {
@@ -2135,41 +2375,6 @@ export function NexusApp() {
                   >
                     {"< Back"}
                   </button>
-                </section>
-              )}
-
-              {connectStep === "joiner_show_answer" && (
-                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
-                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                    Live Sync
-                  </p>
-                  <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                    Show the answer QR
-                  </h2>
-                  <p className="mt-3 text-sm text-[#5a6472]">{connectHint}</p>
-                  <p className="mt-4 text-sm font-semibold text-[#102033]">
-                    {connectStatusMessage}
-                  </p>
-                  <div className="mt-5 grid gap-3 sm:grid-cols-2">
-                    <button
-                      type="button"
-                      onClick={() => void revealCurrentAnswerQr()}
-                      className={pressableCardClasses(
-                        "rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
-                      )}
-                    >
-                      Show Answer QR
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => openScanner("snapshot")}
-                      className={pressableCardClasses(
-                        "rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
-                      )}
-                    >
-                      Re-scan Offer
-                    </button>
-                  </div>
                 </section>
               )}
 
@@ -2330,11 +2535,35 @@ export function NexusApp() {
 
             {securitySection === "profile" && (
               <div className="mt-4 space-y-3">
+                <div>
+                  <p className="text-sm text-[#5a6472]">
+                    Pick what this device should prioritize
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {PREFERENCE_OPTIONS.map((option) => (
+                      <button
+                        key={option}
+                        type="button"
+                        onClick={() => togglePreferenceOption(option)}
+                        className={pressableCardClasses(
+                          classNames(
+                            "rounded-full px-3 py-2 text-sm font-semibold capitalize",
+                            selectedPreferences.includes(option)
+                              ? "bg-[#102033] text-white"
+                              : "bg-white text-[#102033]",
+                          ),
+                        )}
+                      >
+                        {option}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <input
                   value={profilePrefsInput}
                   onChange={(event) => setProfilePrefsInput(event.target.value)}
                   className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
-                  placeholder="Preferences (comma separated): medicine, shelter"
+                  placeholder="More preferences (optional): medicine, insulin"
                 />
                 <textarea
                   value={profileRequirementsInput}
@@ -2366,7 +2595,9 @@ export function NexusApp() {
               <div className="mt-4 space-y-3">
                 <input
                   value={pinSetup}
-                  onChange={(event) => setPinSetup(event.target.value)}
+                  onChange={(event) =>
+                    setPinSetup(normalizePinInput(event.target.value))
+                  }
                   className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
                   inputMode="numeric"
                   placeholder="Set 6-digit PIN"
@@ -2394,6 +2625,15 @@ export function NexusApp() {
 
             {securitySection === "emergency" && (
               <div className="mt-4 space-y-3">
+                <input
+                  value={wipePinInput}
+                  onChange={(event) =>
+                    setWipePinInput(normalizePinInput(event.target.value))
+                  }
+                  className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-center text-[#102033] outline-none"
+                  inputMode="numeric"
+                  placeholder="Enter PIN to confirm wipe"
+                />
                 <button
                   type="button"
                   onClick={() => void handleToggleShake()}
@@ -2403,7 +2643,7 @@ export function NexusApp() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => void handleEmergencyWipe()}
+                  onClick={() => void handleEmergencyWipe({ pin: wipePinInput })}
                   className="w-full rounded-[1.2rem] bg-[#9f2f24] px-4 py-3 text-sm font-semibold text-white"
                 >
                   Emergency Wipe
@@ -2465,14 +2705,14 @@ export function NexusApp() {
                 </p>
                 <h2 className="mt-2 text-2xl font-semibold">
                   {scannerMode === "snapshot" &&
-                    connectStep === "initiator_scan_answer" &&
-                    "Scan Answer QR"}
+                    connectStep === "joiner_enter_code" &&
+                    "Scan Live Sync QR"}
                   {scannerMode === "snapshot" &&
-                    connectStep === "joiner_scan_offer" &&
-                    "Scan Offer QR"}
+                    connectStep !== "joiner_enter_code" &&
+                    connectStep !== "snapshot_scan" &&
+                    "Scan Share QR"}
                   {scannerMode === "snapshot" &&
-                    connectStep !== "initiator_scan_answer" &&
-                    connectStep !== "joiner_scan_offer" &&
+                    connectStep === "snapshot_scan" &&
                     "Scan Share QR"}
                 </h2>
               </div>
