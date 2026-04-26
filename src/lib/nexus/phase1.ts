@@ -7,6 +7,7 @@ export interface CreateMessageInput {
   type: MessageType;
   priority: 1 | 2 | 3 | 4 | 5;
   payload: string;
+  mediaDataUrl?: string;
   crucial_topics?: string[];
   ttlHours?: number;
   confidence?: Confidence;
@@ -38,6 +39,7 @@ export async function createMessage(
     hop_count: 0,
     weight: 1,
     payload: input.payload,
+    media_data_url: input.mediaDataUrl,
     crucial_topics: input.crucial_topics,
     confidence: input.confidence ?? defaultConfidence(input.type),
     supersedes: input.supersedes,

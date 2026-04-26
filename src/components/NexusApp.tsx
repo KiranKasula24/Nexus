@@ -24,8 +24,8 @@ import {
   clearPinAttempts,
   runComposePipeline,
   runLevel3Wipe,
+  runPeerSendDrainPipeline,
   runPeerReceivePipeline,
-  runPeerSendSelectionPipeline,
   runScoringLoop,
   runSnapshotIngressPipeline,
   runSnapshotSharePipeline,
@@ -89,6 +89,7 @@ interface SyncSessionState {
   peerAdvertisedCount: number;
   senderRun?: PipelineRun;
   receivedMessages: NexusMessageWithComputed[];
+  sentMessageIds: Set<string>;
 }
 
 interface DevState {
@@ -146,6 +147,7 @@ function temperatureDot(
 }
 
 function messageLabel(type: MessageType): string {
+  if (type === "image") return "Image";
   if (type === "alert") return "Alert";
   if (type === "audio") return "Audio";
   return "Text";
@@ -238,6 +240,7 @@ function toRawMessage(message: NexusMessageWithComputed): NexusMessage {
     hop_count: message.hop_count,
     weight: message.weight,
     payload: message.payload,
+    media_data_url: message.media_data_url,
     crucial_topics: message.crucial_topics,
     confidence: message.confidence,
     supersedes: message.supersedes,
@@ -269,6 +272,29 @@ function normalizePinInput(value: string): string {
   return value.replace(/\D/g, "").slice(0, 6);
 }
 
+function messageSummary(message: Pick<NexusMessage, "type" | "payload">): string {
+  if (message.type === "image") {
+    return message.payload.trim() || "Shared image";
+  }
+  return message.payload;
+}
+
+async function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+        return;
+      }
+      reject(new Error("Could not read the selected image."));
+    };
+    reader.onerror = () =>
+      reject(reader.error ?? new Error("Could not read the selected image."));
+    reader.readAsDataURL(file);
+  });
+}
+
 export function NexusApp() {
   const repositoryRef = useRef<NexusRepository | null>(null);
   const syncChannelRef = useRef<RTCDataChannel | null>(null);
@@ -282,6 +308,7 @@ export function NexusApp() {
   const syncSessionRef = useRef<SyncSessionState>({
     peerAdvertisedCount: 0,
     receivedMessages: [],
+    sentMessageIds: new Set<string>(),
   });
   const handleSyncWireRef = useRef<((raw: string) => Promise<void>) | null>(
     null,
@@ -296,6 +323,7 @@ export function NexusApp() {
   const [selectedMessage, setSelectedMessage] =
     useState<NexusMessageWithComputed | null>(null);
   const [draftText, setDraftText] = useState("");
+  const [draftImageDataUrl, setDraftImageDataUrl] = useState("");
   const [draftPriority, setDraftPriority] = useState<1 | 2 | 3 | 4 | 5>(4);
   const [draftType, setDraftType] = useState<MessageType | null>(null);
   const [draftSupersedes, setDraftSupersedes] = useState<string | undefined>();
@@ -507,6 +535,7 @@ export function NexusApp() {
     syncSessionRef.current = {
       peerAdvertisedCount: 0,
       receivedMessages: [],
+      sentMessageIds: new Set<string>(),
     };
     setSyncShowcase(null);
     setSyncShowcaseOpen(false);
@@ -533,6 +562,7 @@ export function NexusApp() {
     setProfileRequirementsInput("");
     setProfileTopicsInput("");
     setDraftText("");
+    setDraftImageDataUrl("");
     setDraftTopicsInput("");
     setPinHash("");
     setPinLocked(false);
@@ -771,6 +801,7 @@ export function NexusApp() {
   function beginCompose(message?: NexusMessageWithComputed): void {
     if (message) {
       setDraftText(message.payload);
+      setDraftImageDataUrl(message.media_data_url ?? "");
       setDraftPriority(message.priority);
       setDraftType(message.type);
       setDraftSupersedes(message.id);
@@ -783,6 +814,7 @@ export function NexusApp() {
       );
     } else {
       setDraftText("");
+      setDraftImageDataUrl("");
       setDraftPriority(4);
       setDraftType(null);
       setDraftSupersedes(undefined);
@@ -884,7 +916,12 @@ export function NexusApp() {
       return;
     }
 
-    if (!draftText.trim()) {
+    if (draftType === "image" && !draftImageDataUrl) {
+      noteStatus("warning", "Choose an image to transfer");
+      return;
+    }
+
+    if (draftType !== "image" && !draftText.trim()) {
       noteStatus("warning", "Message is empty");
       return;
     }
@@ -892,7 +929,11 @@ export function NexusApp() {
     const result = await runComposePipeline(repositoryRef.current, {
       type: draftType,
       priority: draftPriority,
-      payload: draftText.trim(),
+      payload:
+        draftType === "image"
+          ? draftText.trim() || "Shared image"
+          : draftText.trim(),
+      mediaDataUrl: draftType === "image" ? draftImageDataUrl : undefined,
       crucial_topics: parseCommaSeparatedList(draftTopicsInput),
       supersedes: draftSupersedes,
     });
@@ -912,6 +953,7 @@ export function NexusApp() {
     );
 
     setDraftText("");
+    setDraftImageDataUrl("");
     setDraftType(null);
     setDraftSupersedes(undefined);
     setDraftTopicsInput((userProfile?.crucialTopics ?? []).join(", "));
@@ -932,11 +974,23 @@ export function NexusApp() {
       return;
     }
 
+    const qrEligibleMessages = selectedShareMessages.filter(
+      (message) => message.type !== "image",
+    );
+    if (qrEligibleMessages.length === 0) {
+      noteStatus(
+        "warning",
+        "Images transfer in nearby sync only",
+        "Use Nearby sync to transfer image messages between devices.",
+      );
+      return;
+    }
+
     try {
       if (!repositoryRef.current) return;
       const result = await runSnapshotSharePipeline(
         repositoryRef.current,
-        selectedShareMessages.map(toRawMessage),
+        qrEligibleMessages.map(toRawMessage),
         userProfile ?? undefined,
       );
       recordPipelineRun(result.run);
@@ -1165,18 +1219,25 @@ export function NexusApp() {
     }
 
     if (wire.type === "BLOOM_OFFER") {
-      const result = await runPeerSendSelectionPipeline(
+      const result = await runPeerSendDrainPipeline(
         repositoryRef.current,
         wire.bloom,
         wire.profile,
+        {
+          excludeIds: [...syncSessionRef.current.sentMessageIds],
+        },
       );
       const queue = result.messages;
       recordPipelineRun(result.run);
+      for (const message of queue) {
+        syncSessionRef.current.sentMessageIds.add(message.id);
+      }
       syncSessionRef.current = {
         ...syncSessionRef.current,
         peerProfile: wire.profile,
         peerAdvertisedCount: wire.messageCount,
         senderRun: result.run,
+        sentMessageIds: syncSessionRef.current.sentMessageIds,
       };
 
       setDevState((current) => ({
@@ -1216,6 +1277,7 @@ export function NexusApp() {
         if (result.message) {
           syncSessionRef.current = {
             ...syncSessionRef.current,
+            sentMessageIds: syncSessionRef.current.sentMessageIds,
             receivedMessages: [
               result.message,
               ...syncSessionRef.current.receivedMessages.filter(
@@ -1231,6 +1293,9 @@ export function NexusApp() {
             lastReceivedCount: current.syncStats.lastReceivedCount + 1,
           },
         }));
+        if (syncChannelRef.current?.readyState === "open") {
+          await sendBloomOffer(syncChannelRef.current);
+        }
       } else if (result.result === "quarantined") {
         await refreshQuarantineCount();
       }
@@ -1240,9 +1305,12 @@ export function NexusApp() {
     if (wire.type === "SYNC_DONE") {
       setSyncText(
         wire.sentCount > 0
-          ? `Connected. Sent ${wire.sentCount} top message${wire.sentCount === 1 ? "" : "s"}.`
+          ? `Connected. Exchanged ${wire.sentCount} priority-sorted message${wire.sentCount === 1 ? "" : "s"} from the current sync pass.`
           : "Connected. The other phone already has the latest messages.",
       );
+      if (syncChannelRef.current?.readyState === "open") {
+        await sendBloomOffer(syncChannelRef.current);
+      }
       openSyncShowcase();
     }
   }
@@ -1811,9 +1879,9 @@ export function NexusApp() {
                               temperatureDot(message.temperature),
                             )}
                           />
-                          <span className="min-w-0 flex-1 truncate text-sm text-[#102033]">
-                            {message.payload}
-                          </span>
+                      <span className="min-w-0 flex-1 truncate text-sm text-[#102033]">
+                            {messageSummary(message)}
+                      </span>
                         </label>
                       );
                     })}
@@ -1898,8 +1966,18 @@ export function NexusApp() {
                         )}
                       </div>
                     </div>
+                    {message.type === "image" && message.media_data_url ? (
+                      <Image
+                        src={message.media_data_url}
+                        alt={message.payload || "Shared image"}
+                        width={1200}
+                        height={800}
+                        unoptimized
+                        className="mt-3 h-44 w-full rounded-[1.2rem] object-cover"
+                      />
+                    ) : null}
                     <p className="mt-3 text-lg leading-7 font-normal text-[#102033]">
-                      {message.payload}
+                      {messageSummary(message)}
                     </p>
                     {!!message.crucial_topics?.length && (
                       <p className="mt-2 text-xs text-[#5a6472]">
@@ -2148,7 +2226,7 @@ export function NexusApp() {
                   Message type is required
                 </p>
                 <div className="mt-3 grid grid-cols-3 gap-2">
-                  {(["text", "alert", "audio"] as MessageType[]).map((type) => (
+                  {(["text", "alert", "audio", "image"] as MessageType[]).map((type) => (
                     <button
                       key={type}
                       type="button"
@@ -2166,10 +2244,55 @@ export function NexusApp() {
                 </div>
                 {!draftType && (
                   <p className="mt-2 text-sm text-amber-900">
-                    Choose whether this is a text update, alert, or audio note before saving.
+                    Choose whether this is a text update, alert, audio note, or image before saving.
                   </p>
                 )}
               </div>
+
+              {draftType === "image" && (
+                <div className="space-y-3 rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4">
+                  <label className="block text-sm text-[#5a6472]">
+                    Select image
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (!file) {
+                          setDraftImageDataUrl("");
+                          return;
+                        }
+                        void fileToDataUrl(file)
+                          .then((dataUrl) => {
+                            setDraftImageDataUrl(dataUrl);
+                            if (!draftText.trim()) {
+                              setDraftText(file.name.replace(/\.[^.]+$/, ""));
+                            }
+                          })
+                          .catch((error: unknown) => {
+                            noteStatus(
+                              "danger",
+                              error instanceof Error
+                                ? error.message
+                                : "Could not read image",
+                            );
+                          });
+                      }}
+                      className="mt-2 block w-full text-sm text-[#102033]"
+                    />
+                  </label>
+                  {draftImageDataUrl && (
+                    <Image
+                      src={draftImageDataUrl}
+                      alt={draftText || "Selected image"}
+                      width={1200}
+                      height={800}
+                      unoptimized
+                      className="h-52 w-full rounded-[1.2rem] object-cover"
+                    />
+                  )}
+                </div>
+              )}
 
               <textarea
                 value={draftText}
@@ -2177,7 +2300,11 @@ export function NexusApp() {
                 className={fieldClasses(
                   "h-44 w-full rounded-[1.5rem] border border-[#d8d0bf] bg-white px-4 py-4 text-base text-[#102033] outline-none",
                 )}
-                placeholder="Road blocked at main gate."
+                placeholder={
+                  draftType === "image"
+                    ? "Optional caption for this image."
+                    : "Road blocked at main gate."
+                }
               />
 
               <label className="block text-sm text-[#5a6472]">
@@ -2236,11 +2363,12 @@ export function NexusApp() {
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <button
                   type="button"
-                  onClick={() => {
-                    setDraftText("");
-                    setDraftType(null);
-                    setDraftSupersedes(undefined);
-                    setSection("relay");
+                    onClick={() => {
+                      setDraftText("");
+                      setDraftImageDataUrl("");
+                      setDraftType(null);
+                      setDraftSupersedes(undefined);
+                      setSection("relay");
                   }}
                   className={pressableCardClasses(
                     "rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
@@ -2977,7 +3105,21 @@ export function NexusApp() {
                       className="rounded-[1rem] bg-[#f3eee4] px-3 py-3 text-sm text-[#102033]"
                     >
                       <span className="font-semibold">{messageLabel(message.type)}:</span>{" "}
-                      {message.payload}
+                      {message.mediaDataUrl ? (
+                        <div className="mt-2">
+                          <Image
+                            src={message.mediaDataUrl}
+                            alt={message.payload || "Received image"}
+                            width={1200}
+                            height={800}
+                            unoptimized
+                            className="h-40 w-full rounded-[1rem] object-cover"
+                          />
+                          <p className="mt-2">{message.payload}</p>
+                        </div>
+                      ) : (
+                        message.payload
+                      )}
                     </div>
                   ))}
                 </div>
@@ -3018,8 +3160,19 @@ export function NexusApp() {
             </div>
 
             <p className="mt-5 text-2xl leading-8 font-semibold text-[#102033]">
-              {selectedMessage.payload}
+              {messageSummary(selectedMessage)}
             </p>
+
+            {selectedMessage.type === "image" && selectedMessage.media_data_url ? (
+              <Image
+                src={selectedMessage.media_data_url}
+                alt={selectedMessage.payload || "Shared image"}
+                width={1200}
+                height={900}
+                unoptimized
+                className="mt-5 h-auto w-full rounded-[1.5rem] object-cover"
+              />
+            ) : null}
 
             {!!selectedMessage.crucial_topics?.length && (
               <p className="mt-2 text-sm text-[#5a6472]">
@@ -3057,6 +3210,14 @@ export function NexusApp() {
                   const message = selectedMessage;
                   setSelectedMessage(null);
                   if (!message || !repositoryRef.current) return;
+                  if (message.type === "image") {
+                    noteStatus(
+                      "warning",
+                      "Images transfer in nearby sync only",
+                      "Open Nearby sync to send this image to another device.",
+                    );
+                    return;
+                  }
                   setSelectedShareIds([message.id]);
                   setSharePanelOpen(true);
                   void runSnapshotSharePipeline(

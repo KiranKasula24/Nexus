@@ -122,6 +122,11 @@ export interface PipelineContext {
     reason?: string;
   }>;
   sessionId?: string;
+  peerSendOptions?: {
+    priorityFloor?: 1 | 2 | 3 | 4 | 5;
+    excludeIds?: string[];
+    limit?: number;
+  };
   terminal?: {
     status: "duplicate" | "expired" | "invalid" | "quarantined";
     reason: string;
@@ -695,19 +700,31 @@ export const RelayGateStage: NexusStage = {
 
     const rankedRelayMessages = context.rankedRelayMessages ?? [];
     const relayBlocked = await shouldRelayBlocked(context.repository);
+    const peerSendOptions =
+      context.mode === "peer_send" ? context.peerSendOptions : undefined;
     const gateResult = applyRelayGate(
       rankedRelayMessages,
       context.mode === "peer_send" ? context.peerProfile : context.localProfile,
       {
-        priorityFloor: 3,
+        priorityFloor: peerSendOptions?.priorityFloor ?? 3,
         blocked: relayBlocked,
         blockedReason: "blocked by Sentinel - device locked",
       },
     );
 
+    const excluded = new Set(peerSendOptions?.excludeIds ?? []);
+    const filteredMessages =
+      excluded.size === 0
+        ? gateResult.selectedMessages
+        : gateResult.selectedMessages.filter((message) => !excluded.has(message.id));
+    const selectedMessages =
+      peerSendOptions?.limit !== undefined
+        ? filteredMessages.slice(0, peerSendOptions.limit)
+        : filteredMessages;
+
     const nextContext: PipelineContext = {
       ...context,
-      selectedMessages: gateResult.selectedMessages,
+      selectedMessages,
       relayGateMatchedTopics: gateResult.matchedTopics,
       relayGateDroppedForFloor: gateResult.droppedForFloor,
       relayGateDroppedForPreference: gateResult.droppedForPreference,
@@ -746,9 +763,9 @@ export const RelayGateStage: NexusStage = {
       stage: {
         component: this.name,
         status: "success",
-        summary: `Passed ${gateResult.selectedMessages.length} of ${rankedRelayMessages.length} messages through Relay Gate.`,
+        summary: `Passed ${selectedMessages.length} of ${rankedRelayMessages.length} messages through Relay Gate.`,
         inputCount: rankedRelayMessages.length,
-        outputCount: gateResult.selectedMessages.length,
+        outputCount: selectedMessages.length,
         matchedTopics: gateResult.matchedTopics,
         droppedForFloor: gateResult.droppedForFloor,
         droppedForPreference: gateResult.droppedForPreference,
@@ -756,11 +773,11 @@ export const RelayGateStage: NexusStage = {
       events: [
         makeEvent(
           this.name,
-          gateResult.selectedMessages.length > 0 ? "success" : "warning",
-          `Relay Gate passed ${gateResult.selectedMessages.length}/${rankedRelayMessages.length} messages.`,
+          selectedMessages.length > 0 ? "success" : "warning",
+          `Relay Gate passed ${selectedMessages.length}/${rankedRelayMessages.length} messages.`,
           {
             inputCount: rankedRelayMessages.length,
-            outputCount: gateResult.selectedMessages.length,
+            outputCount: selectedMessages.length,
             matchedTopics: gateResult.matchedTopics,
             droppedForFloor: gateResult.droppedForFloor,
             droppedForPreference: gateResult.droppedForPreference,
@@ -828,6 +845,7 @@ export const StorageStage: NexusStage = {
           hop_count: oldMessage.hop_count,
           weight: oldMessage.weight,
           payload: oldMessage.payload,
+          media_data_url: oldMessage.media_data_url,
           crucial_topics: oldMessage.crucial_topics,
           confidence: oldMessage.confidence,
           supersedes: oldMessage.supersedes,
@@ -1087,6 +1105,11 @@ export async function runPeerSendSelectionPipeline(
   repository: NexusRepository,
   peerBloomBase64: string,
   peerProfile?: NexusUserProfile,
+  options?: {
+    priorityFloor?: 1 | 2 | 3 | 4 | 5;
+    excludeIds?: string[];
+    limit?: number;
+  },
 ): Promise<{ run: PipelineRun; messages: NexusMessage[] }> {
   const peerBloom = BloomFilter.fromBase64(peerBloomBase64);
   const { run, context } = await runPipeline({
@@ -1095,9 +1118,124 @@ export async function runPeerSendSelectionPipeline(
     peerBloom,
     peerBloomBase64,
     peerProfile,
+    peerSendOptions: options,
   });
 
   return { run, messages: context.selectedMessages ?? [] };
+}
+
+function aggregateStageStatus(
+  statuses: PipelineStageStatus[],
+): PipelineStageStatus {
+  if (statuses.includes("error")) return "error";
+  if (statuses.includes("warning")) return "warning";
+  if (statuses.includes("success")) return "success";
+  return "skipped";
+}
+
+function aggregatePeerSendRuns(
+  runs: PipelineRun[],
+  totalMessages: number,
+): PipelineRun {
+  const stageOrder = PIPELINE_STAGES.peer_send.map((stage) => stage.name);
+  const firstRun = runs[0];
+  const lastRun = runs[runs.length - 1];
+
+  return {
+    id: createSessionId(),
+    mode: "peer_send",
+    status: runs.some((run) => run.status === "failed")
+      ? "failed"
+      : runs.some((run) => run.status === "partial")
+        ? "partial"
+        : "completed",
+    summary:
+      totalMessages > 0
+        ? `Selected ${totalMessages} relay messages across ${runs.length} priority passes.`
+        : lastRun?.summary ?? "No relay messages selected.",
+    startedAt: firstRun?.startedAt ?? Date.now(),
+    completedAt: lastRun?.completedAt ?? Date.now(),
+    stages: stageOrder.map((component) => {
+      const matching = runs
+        .flatMap((run) => run.stages)
+        .filter((stage) => stage.component === component);
+      const lastMatching = matching[matching.length - 1];
+      const matchedTopics = [
+        ...new Set(matching.flatMap((stage) => stage.matchedTopics ?? [])),
+      ];
+      const aggregateInputCount =
+        component === "Relay Gate"
+          ? lastMatching?.inputCount ?? 0
+          : Math.max(...matching.map((stage) => stage.inputCount ?? 0), 0);
+      const aggregateOutputCount =
+        component === "Relay Gate"
+          ? totalMessages
+          : Math.max(...matching.map((stage) => stage.outputCount ?? 0), 0);
+
+      return {
+        component,
+        status: aggregateStageStatus(matching.map((stage) => stage.status)),
+        summary:
+          component === "Relay Gate"
+            ? `Passed ${matching.reduce(
+                (sum, stage) => sum + (stage.outputCount ?? 0),
+                0,
+              )} messages across ${runs.length} priority passes.`
+            : lastMatching?.summary ?? `${component} aggregated.`,
+        inputCount: aggregateInputCount,
+        outputCount: aggregateOutputCount,
+        matchedTopics,
+        droppedForFloor: lastMatching?.droppedForFloor ?? 0,
+        droppedForPreference: lastMatching?.droppedForPreference ?? 0,
+        sentinelBlocked: matching.some((stage) => stage.sentinelBlocked),
+      } satisfies PipelineStageResult;
+    }),
+    events: runs.flatMap((run) => run.events),
+  };
+}
+
+export async function runPeerSendDrainPipeline(
+  repository: NexusRepository,
+  peerBloomBase64: string,
+  peerProfile?: NexusUserProfile,
+  options?: {
+    excludeIds?: string[];
+    limitPerPass?: number;
+  },
+): Promise<{ run: PipelineRun; messages: NexusMessage[] }> {
+  const priorityPasses: Array<1 | 2 | 3 | 4 | 5> = [5, 4, 3, 2, 1];
+  const sentIds = new Set(options?.excludeIds ?? []);
+  const queued: NexusMessage[] = [];
+  const runs: PipelineRun[] = [];
+
+  for (const priorityFloor of priorityPasses) {
+    const result = await runPeerSendSelectionPipeline(
+      repository,
+      peerBloomBase64,
+      peerProfile,
+      {
+        priorityFloor,
+        excludeIds: [...sentIds],
+        limit: options?.limitPerPass,
+      },
+    );
+    runs.push(result.run);
+
+    for (const message of result.messages) {
+      if (sentIds.has(message.id)) continue;
+      sentIds.add(message.id);
+      queued.push(message);
+    }
+
+    if (result.run.stages.some((stage) => stage.sentinelBlocked)) {
+      break;
+    }
+  }
+
+  return {
+    run: aggregatePeerSendRuns(runs, queued.length),
+    messages: queued,
+  };
 }
 
 export async function runPeerReceivePipeline(

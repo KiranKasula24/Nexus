@@ -7,7 +7,7 @@ import type {
 } from "./types";
 import type { NexusRepository } from "./repository";
 
-const ALLOWED_TYPES = new Set(["text", "audio", "alert"]);
+const ALLOWED_TYPES = new Set(["text", "audio", "alert", "image"]);
 export const QUARANTINE_KEY = "quarantine";
 
 function isPriority(value: number): value is 1 | 2 | 3 | 4 | 5 {
@@ -39,6 +39,7 @@ export function applyPrivacy(raw: NexusMessage): NexusMessage {
     hop_count: raw.hop_count,
     weight: raw.weight,
     payload: raw.payload,
+    media_data_url: raw.media_data_url,
     crucial_topics: raw.crucial_topics,
     confidence: raw.confidence,
     supersedes: raw.supersedes,
@@ -81,6 +82,10 @@ export function validateSchema(raw: Partial<NexusMessage>): string | undefined {
 
   if (raw.confidence !== "high" && raw.confidence !== "low") {
     return "Confidence must be high or low.";
+  }
+
+  if (raw.type === "image" && !raw.media_data_url) {
+    return "Image messages must include media data.";
   }
 
   return undefined;
@@ -152,6 +157,7 @@ export function runScoringLoop(
       hop_count: message.hop_count,
       weight: message.weight,
       payload: message.payload,
+      media_data_url: message.media_data_url,
       crucial_topics: message.crucial_topics,
       confidence: message.confidence,
       supersedes: message.supersedes,

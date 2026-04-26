@@ -87,6 +87,7 @@ export function applyRelayGate(
         hop_count: message.hop_count,
         weight: message.weight,
         payload: message.payload,
+        media_data_url: message.media_data_url,
         crucial_topics: message.crucial_topics,
         confidence: message.confidence,
         supersedes: message.supersedes,

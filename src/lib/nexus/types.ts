@@ -1,4 +1,4 @@
-export type MessageType = "text" | "audio" | "alert";
+export type MessageType = "text" | "audio" | "alert" | "image";
 export type Confidence = "high" | "low";
 export type Temperature = "hot" | "warm" | "cold";
 
@@ -11,6 +11,7 @@ export interface NexusMessage {
   hop_count: number;
   weight: number;
   payload: string;
+  media_data_url?: string;
   crucial_topics?: string[];
   confidence: Confidence;
   supersedes?: string;

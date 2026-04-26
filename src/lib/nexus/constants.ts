@@ -7,6 +7,7 @@ export const DEFAULT_TTL_HOURS: Record<MessageType, number> = {
   alert: 6,
   text: 72,
   audio: 48,
+  image: 48,
 };
 
 export const HOT_TEMPERATURE_MULTIPLIER = 3.0;

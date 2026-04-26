@@ -10,6 +10,7 @@ export interface SyncShowcasePreview {
   id: string;
   type: NexusMessageWithComputed["type"];
   payload: string;
+  mediaDataUrl?: string;
   temperature: NexusMessageWithComputed["temperature"];
 }
 
@@ -36,6 +37,7 @@ function previewMessages(
     id: message.id,
     type: message.type,
     payload: message.payload,
+    mediaDataUrl: message.media_data_url,
     temperature: message.temperature,
   }));
 }
