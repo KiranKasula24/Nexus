@@ -325,6 +325,7 @@ export function NexusApp() {
   const [draftText, setDraftText] = useState("");
   const [draftImageDataUrl, setDraftImageDataUrl] = useState("");
   const [draftPriority, setDraftPriority] = useState<1 | 2 | 3 | 4 | 5>(4);
+  const [draftType, setDraftType] = useState<MessageType | null>(null);
   const [draftSupersedes, setDraftSupersedes] = useState<string | undefined>();
   const [draftTopicsInput, setDraftTopicsInput] = useState("");
 
@@ -801,6 +802,7 @@ export function NexusApp() {
       setDraftText(message.payload);
       setDraftImageDataUrl(message.media_data_url ?? "");
       setDraftPriority(message.priority);
+      setDraftType(message.type);
       setDraftSupersedes(message.id);
       setDraftTopicsInput((message.crucial_topics ?? []).join(", "));
       setSelectedMessage(null);
@@ -813,6 +815,7 @@ export function NexusApp() {
       setDraftText("");
       setDraftImageDataUrl("");
       setDraftPriority(4);
+      setDraftType(null);
       setDraftSupersedes(undefined);
       setDraftTopicsInput((userProfile?.crucialTopics ?? []).join(", "));
     }
@@ -907,12 +910,20 @@ export function NexusApp() {
   async function handleSaveDraft(): Promise<void> {
     if (!repositoryRef.current) return;
 
-    if (!draftImageDataUrl && !draftText.trim()) {
-      noteStatus("warning", "Message is empty");
+    if (!draftType) {
+      noteStatus("warning", "Choose a message type");
       return;
     }
 
-    const draftType: MessageType = draftImageDataUrl ? "image" : "text";
+    if (draftType === "image" && !draftImageDataUrl) {
+      noteStatus("warning", "Choose an image to transfer");
+      return;
+    }
+
+    if (draftType !== "image" && !draftText.trim()) {
+      noteStatus("warning", "Message is empty");
+      return;
+    }
 
     const result = await runComposePipeline(repositoryRef.current, {
       type: draftType,
@@ -942,6 +953,7 @@ export function NexusApp() {
 
     setDraftText("");
     setDraftImageDataUrl("");
+    setDraftType(null);
     setDraftSupersedes(undefined);
     setDraftTopicsInput((userProfile?.crucialTopics ?? []).join(", "));
     setSection("relay");
@@ -2216,9 +2228,32 @@ export function NexusApp() {
                 </div>
               )}
 
+              <div>
+                <p className="text-sm text-[#5a6472]">
+                  Message type is required
+                </p>
+                <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {(["text", "alert", "audio", "image"] as MessageType[]).map((type) => (
+                    <button
+                      key={type}
+                      type="button"
+                      onClick={() => setDraftType(type)}
+                      className={classNames(
+                        "rounded-[1.1rem] px-3 py-3.5 text-sm font-semibold transition duration-150 active:scale-[0.98]",
+                        draftType === type
+                          ? "bg-[#102033] text-white"
+                          : "bg-white text-[#102033]",
+                      )}
+                    >
+                      {messageLabel(type)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="space-y-3 rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4">
                 <label className="block text-sm text-[#5a6472]">
-                  Optional image
+                  {draftType === "image" ? "Select image" : "Optional image"}
                   <input
                     type="file"
                     accept="image/*"
@@ -2266,7 +2301,7 @@ export function NexusApp() {
                   "h-44 w-full rounded-[1.5rem] border border-[#d8d0bf] bg-white px-4 py-4 text-base text-[#102033] outline-none",
                 )}
                 placeholder={
-                  draftImageDataUrl
+                  draftType === "image"
                     ? "Optional caption for this image."
                     : "Road blocked at main gate."
                 }
@@ -2331,6 +2366,7 @@ export function NexusApp() {
                     onClick={() => {
                       setDraftText("");
                       setDraftImageDataUrl("");
+                      setDraftType(null);
                       setDraftSupersedes(undefined);
                       setSection("relay");
                   }}
@@ -2344,7 +2380,12 @@ export function NexusApp() {
                   type="button"
                   onClick={() => void handleSaveDraft()}
                   className={pressableCardClasses(
-                    "rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
+                    classNames(
+                      "rounded-[1.3rem] px-4 py-4 text-sm font-semibold",
+                      draftType
+                        ? "bg-[#102033] text-white"
+                        : "bg-[#d9d1c4] text-[#786f60]",
+                    ),
                   )}
                 >
                   Save Message
