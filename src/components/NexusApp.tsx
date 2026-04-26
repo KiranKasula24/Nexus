@@ -147,6 +147,15 @@ function initialDevState(): DevState {
   };
 }
 
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.toLowerCase();
+  return (
+    normalized.startsWith("localhost") ||
+    normalized.startsWith("127.0.0.1") ||
+    normalized.startsWith("[::1]")
+  );
+}
+
 function toRawMessage(message: NexusMessageWithComputed): NexusMessage {
   return {
     id: message.id,
@@ -362,8 +371,40 @@ export function NexusApp() {
       .replace(/\/$/, "");
   }
 
+  function runtimeDefaultHost(): string {
+    if (typeof window === "undefined") {
+      return DEFAULT_SIGNALING_HOST;
+    }
+
+    const hostname = window.location.hostname;
+    const port = window.location.port || "3000";
+    return `${hostname}:${port}`;
+  }
+
+  function resolveSignalingHost(saved: string | null): string {
+    const normalizedSaved = normalizeHostInput(saved ?? "");
+    const fallback = runtimeDefaultHost();
+
+    if (!normalizedSaved) return fallback;
+
+    if (typeof window !== "undefined") {
+      const currentHost = window.location.hostname;
+      const currentIsLoopback =
+        currentHost === "localhost" ||
+        currentHost === "127.0.0.1" ||
+        currentHost === "::1";
+
+      if (!currentIsLoopback && isLoopbackHost(normalizedSaved)) {
+        return fallback;
+      }
+    }
+
+    return normalizedSaved;
+  }
+
   function buildSignalUrl(room: string, role?: "offer" | "answer"): string {
-    const base = `http://${signalingHost}/api/signal/${room}`;
+    const safeHost = signalingHost || runtimeDefaultHost();
+    const base = `http://${safeHost}/api/signal/${room}`;
     if (!role) return base;
     return `${base}?role=${role}`;
   }
@@ -383,14 +424,20 @@ export function NexusApp() {
   ): Promise<void> {
     const url = buildSignalUrl(room);
     console.log("postSignal URL:", url);
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ role, sdp }),
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role, sdp }),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "network error";
+      throw new Error(`Failed to publish ${role} at ${url}: ${message}`);
+    }
 
     if (!response.ok) {
-      throw new Error(`Failed to publish ${role} for room ${room}.`);
+      throw new Error(`Failed to publish ${role} for room ${room} at ${url}.`);
     }
   }
 
@@ -398,9 +445,17 @@ export function NexusApp() {
     room: string,
     role: "offer" | "answer",
   ): Promise<string | null> {
-    const response = await fetch(buildSignalUrl(room, role));
+    const url = buildSignalUrl(room, role);
+    let response: Response;
+    try {
+      response = await fetch(url);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "network error";
+      throw new Error(`Failed to read ${role} at ${url}: ${message}`);
+    }
+
     if (!response.ok) {
-      throw new Error(`Failed to read ${role} for room ${room}.`);
+      throw new Error(`Failed to read ${role} for room ${room} at ${url}.`);
     }
 
     const payload = (await response.json()) as { sdp: string | null };
@@ -443,7 +498,7 @@ export function NexusApp() {
       setMessages(await repository.getAll());
 
       const saved = localStorage.getItem(SIGNALING_HOST_KEY);
-      const host = normalizeHostInput(saved || DEFAULT_SIGNALING_HOST);
+      const host = resolveSignalingHost(saved);
       setSignalingHost(host);
       setNetworkDraftHost(host);
       setSignalingHostConfirmed(true);
