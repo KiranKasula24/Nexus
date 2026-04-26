@@ -7,6 +7,8 @@ import { sortByScoreDesc } from "./scoring";
 import type { NexusMessage } from "./types";
 
 const SNAPSHOT_PREFIX = "S";
+const LIVE_OFFER_PREFIX = "O";
+const LIVE_ANSWER_PREFIX = "A";
 const WEBRTC_PREFIX = "W";
 const LEGACY_LIVE_PREFIX = "L";
 
@@ -62,11 +64,20 @@ export function buildSnapshot(
   throw new Error("Unable to create a valid snapshot payload.");
 }
 
+export function buildLiveOfferPayload(offerToken: string): string {
+  return `${LIVE_OFFER_PREFIX}${offerToken}`;
+}
+
+export function buildLiveAnswerPayload(answerToken: string): string {
+  return `${LIVE_ANSWER_PREFIX}${answerToken}`;
+}
+
 export function decodeTransportPayload(
   payload: string,
 ):
   | { kind: "snapshot"; messages: NexusMessage[] }
-  | { kind: "webrtc"; offer: string }
+  | { kind: "live_offer"; offer: string }
+  | { kind: "live_answer"; answer: string }
   | { kind: "legacy"; url: string } {
   const prefix = payload[0];
   const body = payload.slice(1);
@@ -80,14 +91,16 @@ export function decodeTransportPayload(
     };
   }
 
+  if (prefix === LIVE_OFFER_PREFIX) {
+    return { kind: "live_offer", offer: body };
+  }
+
+  if (prefix === LIVE_ANSWER_PREFIX) {
+    return { kind: "live_answer", answer: body };
+  }
+
   if (prefix === WEBRTC_PREFIX) {
-    try {
-      const compressed = fromBase64(body);
-      const inflated = pako.inflate(compressed, { to: "string" }) as string;
-      return { kind: "webrtc", offer: inflated };
-    } catch {
-      return { kind: "webrtc", offer: body };
-    }
+    return { kind: "live_offer", offer: payload };
   }
 
   if (prefix === LEGACY_LIVE_PREFIX) {

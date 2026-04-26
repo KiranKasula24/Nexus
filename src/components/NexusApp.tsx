@@ -4,9 +4,12 @@ import Image from "next/image";
 import QRCode from "qrcode";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  buildLiveAnswerPayload,
+  buildLiveOfferPayload,
   buildBloomFromMessages,
   createInitiator,
   createJoiner,
+  decodeTransportPayload,
   finalizeInitiator,
   loadPinHash,
   monitorTripleShake,
@@ -45,8 +48,10 @@ type BeforeInstallPromptEvent = Event & {
 };
 type ConnectStep =
   | "pick_role"
-  | "initiator_show_code"
-  | "joiner_enter_code"
+  | "initiator_show_offer"
+  | "initiator_scan_answer"
+  | "joiner_scan_offer"
+  | "joiner_show_answer"
   | "connected"
   | "snapshot_scan";
 type SyncWire =
@@ -82,13 +87,8 @@ interface DevState {
   syncStats: SyncStats;
 }
 
-const SIGNALING_HOST_KEY = "nexus_signaling_host";
 const INSTALL_BANNER_DISMISSED_KEY = "nexus_install_banner_dismissed";
-const DEFAULT_SIGNALING_HOST = "nexus-8nw1.vercel.app";
-const SIGNAL_ROOM_CODE_LENGTH = 6;
-const SIGNAL_ROOM_CODE_PATTERN = new RegExp(
-  `^\\d{${SIGNAL_ROOM_CODE_LENGTH}}$`,
-);
+const HANDSHAKE_TIMEOUT_MS = 90_000;
 
 function classNames(
   ...parts: Array<string | false | null | undefined>
@@ -123,10 +123,6 @@ function messageLabel(type: MessageType): string {
   if (type === "alert") return "Alert";
   if (type === "audio") return "Audio";
   return "Text";
-}
-
-function formatRoomCode(room: string): string {
-  return room.replace(/(\d{3})(?=\d)/g, "$1 ");
 }
 
 function formatRelativeTone(
@@ -164,36 +160,6 @@ function initialDevState(): DevState {
   };
 }
 
-function isLoopbackHost(host: string): boolean {
-  const normalized = host.toLowerCase();
-  return (
-    normalized.startsWith("localhost") ||
-    normalized.startsWith("127.0.0.1") ||
-    normalized.startsWith("[::1]")
-  );
-}
-
-function isIpHost(host: string): boolean {
-  const withoutPort = host.replace(/:\d+$/, "");
-  return /^\d{1,3}(\.\d{1,3}){3}$/.test(withoutPort);
-}
-
-function stripPort(host: string): string {
-  return host.replace(/:\d+$/, "");
-}
-
-function normalizeSignalingHostValue(host: string): string {
-  const normalized = host.trim();
-  if (!normalized) return normalized;
-
-  const baseHost = stripPort(normalized);
-  if (isLoopbackHost(baseHost) || isIpHost(baseHost)) {
-    return normalized;
-  }
-
-  return baseHost;
-}
-
 function toRawMessage(message: NexusMessageWithComputed): NexusMessage {
   return {
     id: message.id,
@@ -222,8 +188,7 @@ export function NexusApp() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const offerPeerRef = useRef<PeerArtifacts | null>(null);
   const joinerPeerRef = useRef<PeerArtifacts | null>(null);
-  const answerPollingRef = useRef<number | null>(null);
-  const answerPollingDeadlineRef = useRef<number | null>(null);
+  const handshakeTimeoutRef = useRef<number | null>(null);
   const handleSyncWireRef = useRef<((raw: string) => Promise<void>) | null>(
     null,
   );
@@ -251,20 +216,13 @@ export function NexusApp() {
   const [statusTone, setStatusTone] = useState<StatusTone>("ready");
   const [statusText, setStatusText] = useState("Ready");
   const [syncText, setSyncText] = useState(
-    "Join the same hotspot, then connect",
+    "Live sync works best when both phones stay on the same hotspot or Wi-Fi.",
   );
   const [scannerStatus, setScannerStatus] = useState("Scanner idle");
   const [storageWarning, setStorageWarning] = useState("");
   const [peerState, setPeerState] = useState<PeerState>("idle");
   const [sharePanelOpen, setSharePanelOpen] = useState(false);
   const [selectedShareIds, setSelectedShareIds] = useState<string[]>([]);
-  const [reconnectRoomCode, setReconnectRoomCode] = useState("");
-  const [showReconnectBanner, setShowReconnectBanner] = useState(false);
-  const [signalingHost, setSignalingHost] = useState(DEFAULT_SIGNALING_HOST);
-  const [signalingHostConfirmed, setSignalingHostConfirmed] = useState(true);
-  const [networkDraftHost, setNetworkDraftHost] = useState(
-    DEFAULT_SIGNALING_HOST,
-  );
   const [installPromptEvent, setInstallPromptEvent] =
     useState<BeforeInstallPromptEvent | null>(null);
   const [installBannerVisible, setInstallBannerVisible] = useState(false);
@@ -272,7 +230,7 @@ export function NexusApp() {
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [securitySection, setSecuritySection] = useState<
-    "security" | "emergency" | "developer" | "profile" | "network"
+    "security" | "emergency" | "developer" | "profile"
   >("security");
   const [pinSetup, setPinSetup] = useState("123456");
   const [pinAttempt, setPinAttempt] = useState("123456");
@@ -288,9 +246,10 @@ export function NexusApp() {
 
   const [scannerMode, setScannerMode] = useState<ScannerMode | null>(null);
   const [connectStep, setConnectStep] = useState<ConnectStep>("pick_role");
-  const [roomCode, setRoomCode] = useState("");
-  const [joinRoomCode, setJoinRoomCode] = useState("");
   const [connectStatusMessage, setConnectStatusMessage] = useState("");
+  const [connectHint, setConnectHint] = useState(
+    "Both phones should stay on the same hotspot or Wi-Fi.",
+  );
   const [snapshotQrUrl, setSnapshotQrUrl] = useState("");
   const [snapshotQrTitle, setSnapshotQrTitle] = useState("");
   const [snapshotQrDetail, setSnapshotQrDetail] = useState("");
@@ -340,9 +299,8 @@ export function NexusApp() {
   useEffect(() => {
     if (section !== "connect") {
       setConnectStep("pick_role");
-      setRoomCode("");
-      setJoinRoomCode("");
       setConnectStatusMessage("");
+      setConnectHint("Both phones should stay on the same hotspot or Wi-Fi.");
     }
   }, [section]);
 
@@ -455,159 +413,46 @@ export function NexusApp() {
     }
   }
 
-  function normalizeHostInput(value: string): string {
-    return value
-      .trim()
-      .replace(/^https?:\/\//i, "")
-      .replace(/\/$/, "");
-  }
-
-  function runtimeDefaultHost(): string {
-    if (typeof window === "undefined") {
-      return DEFAULT_SIGNALING_HOST;
-    }
-
-    const hostname = window.location.hostname;
-    const port = window.location.port;
-    return normalizeSignalingHostValue(port ? `${hostname}:${port}` : hostname);
-  }
-
-  function resolveSignalingHost(saved: string | null): string {
-    const normalizedSaved = normalizeSignalingHostValue(
-      normalizeHostInput(saved ?? ""),
-    );
-    const fallback = runtimeDefaultHost();
-
-    if (!normalizedSaved) return fallback;
-
-    if (typeof window !== "undefined") {
-      const currentHost = window.location.hostname;
-      const currentIsLoopback =
-        currentHost === "localhost" ||
-        currentHost === "127.0.0.1" ||
-        currentHost === "::1";
-
-      if (!currentIsLoopback && isLoopbackHost(normalizedSaved)) {
-        return fallback;
-      }
-    }
-
-    return normalizedSaved;
-  }
-
-  function buildSignalApiUrl(path: string): string {
-    const safeHost = normalizeSignalingHostValue(
-      signalingHost || runtimeDefaultHost(),
-    );
-    const preferHttp =
-      isLoopbackHost(stripPort(safeHost)) || isIpHost(stripPort(safeHost));
-    const protocol = preferHttp ? "http" : "https";
-    return `${protocol}://${safeHost}${path}`;
-  }
-
-  function buildSignalRoomUrl(room: string, role?: "offer" | "answer"): string {
-    const base = buildSignalApiUrl(`/api/signal/${room}`);
-    if (!role) return base;
-    return `${base}?role=${role}`;
-  }
-
-  function buildSignalRoomsUrl(): string {
-    return buildSignalApiUrl("/api/signal/rooms");
-  }
-
   function closePeerArtifacts(peer: PeerArtifacts | null): void {
     peer?.channel.close();
     peer?.connection.close();
   }
 
-  function clearAnswerPolling(): void {
-    if (answerPollingRef.current) {
-      window.clearInterval(answerPollingRef.current);
-      answerPollingRef.current = null;
-    }
-    answerPollingDeadlineRef.current = null;
-  }
-
-  async function createSignalRoom(offerSdp: string): Promise<string> {
-    const url = buildSignalRoomsUrl();
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ offerSdp }),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "network error";
-      throw new Error(`Failed to create room at ${url}: ${message}`);
-    }
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(
-        `Failed to create room at ${url}. Status ${response.status}. ${body}`,
-      );
-    }
-
-    const payload = (await response.json()) as { room?: string };
-    if (!payload.room) {
-      throw new Error(`Signal server returned no room code from ${url}.`);
-    }
-
-    return payload.room;
-  }
-
-  async function postSignal(
-    room: string,
-    role: "answer",
-    sdp: string,
-  ): Promise<void> {
-    const url = buildSignalRoomUrl(room);
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role, sdp }),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "network error";
-      throw new Error(`Failed to publish ${role} at ${url}: ${message}`);
-    }
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(
-        `Failed to publish ${role} for room ${room} at ${url}. Status ${response.status}. ${body}`,
-      );
+  function clearHandshakeTimeout(): void {
+    if (handshakeTimeoutRef.current) {
+      window.clearTimeout(handshakeTimeoutRef.current);
+      handshakeTimeoutRef.current = null;
     }
   }
 
-  async function getSignal(
-    room: string,
-    role: "offer" | "answer",
-  ): Promise<string | null> {
-    const url = buildSignalRoomUrl(room, role);
-    let response: Response;
-    try {
-      response = await fetch(url);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "network error";
-      throw new Error(`Failed to read ${role} at ${url}: ${message}`);
+  function resetNearbyFlow(options?: { preserveStatus?: boolean }): void {
+    clearHandshakeTimeout();
+    intentionalCloseRef.current = true;
+    syncChannelRef.current = null;
+    hideSnapshotQr();
+    closePeerArtifacts(offerPeerRef.current);
+    closePeerArtifacts(joinerPeerRef.current);
+    offerPeerRef.current = null;
+    joinerPeerRef.current = null;
+    setConnectStep("pick_role");
+    setPeerState("idle");
+    setConnectHint("Both phones should stay on the same hotspot or Wi-Fi.");
+    if (!options?.preserveStatus) {
+      setConnectStatusMessage("");
     }
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(
-        `Failed to read ${role} for room ${room} at ${url}. Status ${response.status}. ${body}`,
-      );
-    }
-
-    const payload = (await response.json()) as { sdp: string | null };
-    return payload.sdp;
   }
 
-  async function showSnapshotQr(
+  function beginHandshakeTimeout(message: string): void {
+    clearHandshakeTimeout();
+    handshakeTimeoutRef.current = window.setTimeout(() => {
+      resetNearbyFlow({ preserveStatus: true });
+      setConnectStatusMessage(message);
+      setSyncText("Live sync timed out. Snapshot sharing still works offline.");
+      noteStatus("warning", "Nearby sync timed out");
+    }, HANDSHAKE_TIMEOUT_MS);
+  }
+
+  async function showTransportQr(
     title: string,
     detail: string,
     payload: string,
@@ -626,13 +471,24 @@ export function NexusApp() {
     setSnapshotQrUrl("");
   }
 
-  function saveSignalingHost(rawHost: string): void {
-    const host = normalizeSignalingHostValue(normalizeHostInput(rawHost));
-    if (!host) return;
-    localStorage.setItem(SIGNALING_HOST_KEY, host);
-    setSignalingHost(host);
-    setNetworkDraftHost(host);
-    setSignalingHostConfirmed(true);
+  async function revealCurrentOfferQr(): Promise<void> {
+    if (!devState.lastOfferToken) return;
+    await showTransportQr(
+      "Live Sync Offer",
+      "Phone 2 should scan this QR to prepare the direct nearby link. After that, scan the answer QR back on this phone.",
+      buildLiveOfferPayload(devState.lastOfferToken),
+      formatRelativeTone("warning", "Step 1 of 2"),
+    );
+  }
+
+  async function revealCurrentAnswerQr(): Promise<void> {
+    if (!devState.lastAnswerToken) return;
+    await showTransportQr(
+      "Live Sync Answer",
+      "Phone 1 should scan this answer QR to complete the nearby live link.",
+      buildLiveAnswerPayload(devState.lastAnswerToken),
+      formatRelativeTone("warning", "Step 2 of 2"),
+    );
   }
 
   function dismissInstallBanner(): void {
@@ -666,12 +522,6 @@ export function NexusApp() {
 
     const hydrate = async (): Promise<void> => {
       setMessages(await repository.getAll());
-
-      const saved = localStorage.getItem(SIGNALING_HOST_KEY);
-      const host = resolveSignalingHost(saved);
-      setSignalingHost(host);
-      setNetworkDraftHost(host);
-      setSignalingHostConfirmed(true);
 
       const storedProfile =
         await repository.getSystemState<NexusUserProfile>(USER_PROFILE_KEY);
@@ -715,7 +565,7 @@ export function NexusApp() {
 
     return () => {
       intentionalCloseRef.current = true;
-      clearAnswerPolling();
+      clearHandshakeTimeout();
       stopScoring();
       stopSweep();
       scannerStopRef.current?.();
@@ -903,7 +753,7 @@ export function NexusApp() {
         ...current,
         lastSnapshotPayload: snapshot.qr,
       }));
-      await showSnapshotQr(
+      await showTransportQr(
         "Share QR",
         "Share the messages you picked with another phone.",
         snapshot.qr,
@@ -970,21 +820,22 @@ export function NexusApp() {
       const state = peer.connection.connectionState;
       if (state === "connecting") {
         setPeerState("connecting");
-        setConnectStatusMessage("Negotiating secure peer link...");
-        setSyncText("Connecting phones...");
+        setConnectStatusMessage("Negotiating local peer link...");
+        setSyncText("Trying to connect both phones directly over the local network.");
         noteStatus("warning", "Connecting");
       } else if (state === "connected") {
         setPeerState("connected");
         setConnectStep("connected");
         setConnectStatusMessage("");
+        setConnectHint("Stay nearby while the phones finish syncing.");
         setSyncText("Phones connected.");
         noteStatus("active", "Connected");
       } else if (state === "disconnected" || state === "failed") {
         setPeerState("disconnected");
         setConnectStatusMessage(
-          "Peer connection failed. Make a fresh room code and try again.",
+          "Local-only live sync failed. Try again on the same hotspot or use snapshot QR instead.",
         );
-        setSyncText("Connection failed. Try making a new code.");
+        setSyncText("Connection failed. Snapshot sharing still works offline.");
         noteStatus(
           "danger",
           "Connection failed",
@@ -1009,22 +860,21 @@ export function NexusApp() {
       pushDevLog(
         "warning",
         "ICE error",
-        "A network candidate failed. If this keeps happening, create a fresh code on both phones.",
+        "A local network candidate failed. Keep both phones on the same hotspot or Wi-Fi and try again.",
       );
     };
 
     peer.channel.onopen = () => {
+      clearHandshakeTimeout();
       setPeerState("connected");
       setConnectStep("connected");
       setConnectStatusMessage("");
-      setShowReconnectBanner(false);
-      setReconnectRoomCode("");
-      clearAnswerPolling();
+      setConnectHint("Live sync stays direct and fully offline while the link is open.");
       setSyncText("Connected. Sharing can continue in the background.");
       noteStatus(
         "active",
         "Connected",
-        "The phones are linked on the same hotspot.",
+        "The phones are linked directly on the same local network.",
       );
 
       void sendBloomOffer(peer.channel);
@@ -1053,28 +903,14 @@ export function NexusApp() {
       }
       setPeerState("disconnected");
       setConnectStep("pick_role");
-      setRoomCode("");
-      setJoinRoomCode("");
+      setConnectHint("Both phones should stay on the same hotspot or Wi-Fi.");
       setSyncText("Peer disconnected. Ready for the next encounter.");
       noteStatus(
         "warning",
         "Disconnected",
         "The link closed. Messages stay on this phone.",
       );
-
-      clearAnswerPolling();
-
-      if (!intentionalCloseRef.current) {
-        void handleStartInitiator(true).catch((error: unknown) => {
-          pushDevLog(
-            "warning",
-            "Reconnect failed",
-            error instanceof Error
-              ? error.message
-              : "Could not create reconnect room.",
-          );
-        });
-      }
+      clearHandshakeTimeout();
     };
 
     peer.channel.onmessage = (event) => {
@@ -1170,7 +1006,9 @@ export function NexusApp() {
     if (!repositoryRef.current) return;
 
     try {
-      if (decoded.startsWith("S")) {
+      const payload = decodeTransportPayload(decoded);
+
+      if (payload.kind === "snapshot") {
         const result = await runSnapshotIngressPipeline(
           repositoryRef.current,
           decoded,
@@ -1187,29 +1025,79 @@ export function NexusApp() {
         return;
       }
 
+      if (payload.kind === "live_offer") {
+        if (connectStep !== "joiner_scan_offer") {
+          noteStatus(
+            "warning",
+            "This QR starts live sync",
+            "Use it from Receive Live Sync on the second phone.",
+          );
+          return;
+        }
+
+        setConnectStatusMessage("Offer scanned. Creating local answer...");
+        setConnectHint("Keep this answer QR visible while the first phone scans it.");
+        const joiner = await createJoiner(payload.offer);
+        await attachPeer(joiner.peer, "joiner");
+        const answerPayload = buildLiveAnswerPayload(joiner.answerToken);
+
+        setDevState((current) => ({
+          ...current,
+          lastAnswerToken: joiner.answerToken,
+        }));
+
+        setConnectStep("joiner_show_answer");
+        setConnectStatusMessage("Show this answer QR to the first phone.");
+        await showTransportQr(
+          "Live Sync Answer",
+          "Phone 1 should scan this answer QR to complete the nearby live link.",
+          answerPayload,
+          formatRelativeTone("warning", "Step 2 of 2"),
+        );
+        beginHandshakeTimeout(
+          "Timed out waiting for the first phone to scan the answer QR.",
+        );
+        return;
+      }
+
+      if (payload.kind === "live_answer") {
+        if (connectStep !== "initiator_scan_answer" || !offerPeerRef.current) {
+          noteStatus(
+            "warning",
+            "This QR completes live sync",
+            "Start on the first phone and scan the answer from there.",
+          );
+          return;
+        }
+
+        setConnectStatusMessage("Answer scanned. Finalizing local peer link...");
+        await finalizeInitiator(offerPeerRef.current.connection, payload.answer);
+        setConnectHint("Connection is being finalized directly between both phones.");
+        hideSnapshotQr();
+        return;
+      }
+
       noteStatus("warning", "Unsupported QR payload kind");
     } catch (error) {
       noteStatus(
         "danger",
         error instanceof Error ? error.message : "Could not decode QR",
       );
+      if (connectStep === "joiner_scan_offer" || connectStep === "initiator_scan_answer") {
+        setConnectStatusMessage(
+          error instanceof Error ? error.message : "Could not decode QR",
+        );
+      }
     }
   }
 
-  async function handleStartInitiator(isReconnect = false): Promise<void> {
-    if (!signalingHost) {
-      setConnectStatusMessage("Set the network server host first.");
-      setSettingsOpen(true);
-      setSecuritySection("network");
-      return;
-    }
-
-    clearAnswerPolling();
-
+  async function handleStartInitiator(): Promise<void> {
     try {
-      setRoomCode("");
-      setConnectStatusMessage("Creating secure room...");
-      setConnectStep("initiator_show_code");
+      resetNearbyFlow({ preserveStatus: true });
+      hideSnapshotQr();
+      setConnectStatusMessage("Creating local-only live sync offer...");
+      setConnectHint("Phone 2 should scan this QR while both phones stay on the same hotspot or Wi-Fi.");
+      setConnectStep("initiator_show_offer");
       setSection("connect");
 
       const result = await createInitiator();
@@ -1220,140 +1108,46 @@ export function NexusApp() {
         lastOfferToken: result.offerToken,
       }));
 
-      const createdRoom = await createSignalRoom(result.offerToken);
-      setRoomCode(createdRoom);
-      setConnectStatusMessage("Waiting for other device...");
-
-      answerPollingDeadlineRef.current = Date.now() + 120_000;
-      answerPollingRef.current = window.setInterval(() => {
-        if (
-          !answerPollingDeadlineRef.current ||
-          Date.now() > answerPollingDeadlineRef.current
-        ) {
-          clearAnswerPolling();
-          setConnectStatusMessage("Timed out waiting for other device.");
-          return;
-        }
-
-        void (async () => {
-          try {
-            const answerSdp = await getSignal(createdRoom, "answer");
-            if (!answerSdp) return;
-
-            clearAnswerPolling();
-            setConnectStatusMessage("Answer received, connecting...");
-
-            if (!offerPeerRef.current) {
-              setConnectStatusMessage("Offer session expired. Start again.");
-              return;
-            }
-
-            try {
-              await finalizeInitiator(
-                offerPeerRef.current.connection,
-                answerSdp,
-              );
-            } catch (error) {
-              setConnectStatusMessage(
-                error instanceof Error
-                  ? error.message
-                  : "Could not finalize peer connection.",
-              );
-            }
-          } catch (error) {
-            setConnectStatusMessage(
-              error instanceof Error
-                ? error.message
-                : "Waiting for other device...",
-            );
-          }
-        })();
-      }, 2_000);
-
-      if (isReconnect) {
-        setReconnectRoomCode(createdRoom);
-        setShowReconnectBanner(true);
-        setConnectStatusMessage("Waiting for other device...");
-      } else {
-        setShowReconnectBanner(false);
-        setReconnectRoomCode("");
-      }
-
-      setSyncText("Share the room code with the other device.");
+      await showTransportQr(
+        "Live Sync Offer",
+        "Phone 2 should scan this QR to prepare the direct nearby link. After that, scan the answer QR back on this phone.",
+        buildLiveOfferPayload(result.offerToken),
+        formatRelativeTone("warning", "Step 1 of 2"),
+      );
+      setConnectStep("initiator_scan_answer");
+      setConnectStatusMessage("Waiting for the second phone to scan and return an answer QR.");
+      setSyncText("Live sync bootstrap is ready.");
+      beginHandshakeTimeout(
+        "Timed out waiting for the second phone to return an answer QR.",
+      );
       pushDevLog(
         "active",
-        isReconnect ? "Reconnect room created" : "Room created",
-        `Created room ${createdRoom} and published offer token.`,
+        "Offer QR ready",
+        "Prepared a local-only live sync offer QR for the second phone.",
       );
     } catch (error) {
-      clearAnswerPolling();
-      intentionalCloseRef.current = true;
-      closePeerArtifacts(offerPeerRef.current);
-      offerPeerRef.current = null;
-      syncChannelRef.current = null;
-      setRoomCode("");
-      setConnectStep("pick_role");
+      resetNearbyFlow({ preserveStatus: true });
       setConnectStatusMessage(
         error instanceof Error
           ? error.message
-          : "Unable to contact signaling server.",
+          : "Unable to start local-only live sync.",
       );
       noteStatus(
         "danger",
         "Connection setup failed",
-        error instanceof Error ? error.message : "Unable to contact signaling server.",
+        error instanceof Error ? error.message : "Unable to start local-only live sync.",
       );
     }
   }
 
-  async function handleJoinerSubmit(enteredCode: string): Promise<void> {
-    if (!signalingHost) {
-      setConnectStatusMessage("Set the network server host first.");
-      return;
-    }
-
-    const room = enteredCode.trim();
-    if (!SIGNAL_ROOM_CODE_PATTERN.test(room)) {
-      setConnectStatusMessage(
-        `Enter a valid ${SIGNAL_ROOM_CODE_LENGTH}-digit room code.`,
-      );
-      return;
-    }
-
-    setConnectStatusMessage("Checking room...");
-
-    try {
-      const offerSdp = await getSignal(room, "offer");
-      if (!offerSdp) {
-        setConnectStatusMessage(
-          "Room not found. Check the code and try again.",
-        );
-        return;
-      }
-
-      const joiner = await createJoiner(offerSdp);
-      await attachPeer(joiner.peer, "joiner");
-      await postSignal(room, "answer", joiner.answerToken);
-
-      setDevState((current) => ({
-        ...current,
-        lastAnswerToken: joiner.answerToken,
-      }));
-
-      setConnectStatusMessage("Answer sent. Finalizing peer connection...");
-      setSyncText("Handshake completed. Waiting for WebRTC link.");
-      pushDevLog("active", "Joined room", `Submitted answer for room ${room}.`);
-    } catch (error) {
-      intentionalCloseRef.current = true;
-      closePeerArtifacts(joinerPeerRef.current);
-      joinerPeerRef.current = null;
-      syncChannelRef.current = null;
-      setConnectStatusMessage(
-        error instanceof Error
-          ? error.message
-          : "Could not join room. Try again.",
-      );
-    }
+  function handleStartJoiner(): void {
+    resetNearbyFlow({ preserveStatus: true });
+    hideSnapshotQr();
+    setConnectStep("joiner_scan_offer");
+    setConnectStatusMessage("Scan the offer QR from the first phone.");
+    setConnectHint("Keep both phones on the same hotspot or Wi-Fi during the whole handshake.");
+    setSection("connect");
+    openScanner("snapshot");
   }
 
   async function handleSavePin(): Promise<void> {
@@ -1463,39 +1257,6 @@ export function NexusApp() {
   });
 
   if (!mounted) return null;
-
-  if (!signalingHostConfirmed) {
-    return (
-      <main className="flex min-h-screen items-center justify-center px-4 py-8">
-        <section className="w-full max-w-xl rounded-[2rem] border border-[#ddd1be] bg-[#f8f4eb] p-6 shadow-[0_20px_80px_rgba(16,32,51,0.12)]">
-          <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#945f3d]">
-            Network Setup
-          </p>
-          <h1 className="mt-3 text-3xl font-semibold text-[#102033]">
-            Network Setup
-          </h1>
-          <p className="mt-2 text-sm text-[#5a6472]">
-            Enter the address of the device running the Nexus server on your
-            local network. This is only used to establish connections - no
-            messages are sent to this address.
-          </p>
-          <input
-            value={networkDraftHost}
-            onChange={(event) => setNetworkDraftHost(event.target.value)}
-            className="mt-6 w-full rounded-2xl border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
-            placeholder="192.168.1.x:3000"
-          />
-          <button
-            type="button"
-            onClick={() => saveSignalingHost(networkDraftHost)}
-            className="mt-4 w-full rounded-2xl bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
-          >
-            Save and Continue
-          </button>
-        </section>
-      </main>
-    );
-  }
 
   if (profileSetupOpen) {
     return (
@@ -1667,29 +1428,6 @@ export function NexusApp() {
 
           {section === "relay" && (
             <section className="mt-6 space-y-4">
-              {showReconnectBanner && reconnectRoomCode && (
-                <div className="rounded-[1.4rem] border border-amber-200 bg-amber-50 px-4 py-4 text-[#102033]">
-                  <p className="text-sm font-semibold">Peer disconnected.</p>
-                  <p className="mt-1 text-sm text-[#5a6472]">
-                    Reconnecting - share code{" "}
-                    {formatRoomCode(reconnectRoomCode)} with the other device.
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSection("connect");
-                      setConnectStep("initiator_show_code");
-                      setRoomCode(reconnectRoomCode);
-                    }}
-                    className={pressableCardClasses(
-                      "mt-3 rounded-full bg-[#102033] px-4 py-2 text-sm font-semibold text-white",
-                    )}
-                  >
-                    Open Nearby
-                  </button>
-                </div>
-              )}
-
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <button
                   type="button"
@@ -2187,28 +1925,26 @@ export function NexusApp() {
                       "w-full rounded-[1.5rem] bg-[#102033] px-6 py-6 text-left text-white",
                     )}
                   >
-                    <span className="block text-2xl font-semibold">Share</span>
+                    <span className="block text-2xl font-semibold">
+                      Live Sync Nearby
+                    </span>
                     <span className="mt-2 block text-sm text-white/70">
-                      Generate a secure 6-digit room code
+                      Show an offer QR, then scan the answer QR back on this phone
                     </span>
                   </button>
 
                   <button
                     type="button"
-                    onClick={() => {
-                      setConnectStep("joiner_enter_code");
-                      setJoinRoomCode("");
-                      setConnectStatusMessage("");
-                    }}
+                    onClick={handleStartJoiner}
                     className={pressableCardClasses(
                       "w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-6 py-6 text-left text-[#102033]",
                     )}
                   >
                     <span className="block text-2xl font-semibold">
-                      Receive
+                      Receive Live Sync
                     </span>
                     <span className="mt-2 block text-sm text-[#5a6472]">
-                      Enter a secure 6-digit room code
+                      Scan the offer QR from the first phone
                     </span>
                   </button>
 
@@ -2220,38 +1956,57 @@ export function NexusApp() {
                     }}
                     className="text-left text-sm font-semibold text-[#945f3d]"
                   >
-                    Just scan a snapshot QR {"->"}
+                    Share or scan a snapshot QR {"->"}
                   </button>
                 </>
               )}
 
-              {connectStep === "initiator_show_code" && (
+              {(connectStep === "initiator_show_offer" ||
+                connectStep === "initiator_scan_answer") && (
                 <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
+                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                    Live Sync
+                  </p>
                   <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                    Share this room code
+                    Start the nearby link
                   </h2>
-                  <div className="mt-5 rounded-[1.6rem] bg-white p-8 text-center shadow-[0_18px_60px_rgba(16,32,51,0.14)]">
-                    <p className="text-5xl font-bold tracking-[0.35em] text-[#102033]">
-                      {roomCode ? formatRoomCode(roomCode) : "------"}
-                    </p>
-                  </div>
                   <p className="mt-4 text-sm text-[#5a6472]">
-                    Share this code with the other device.
+                    {connectHint}
                   </p>
                   <p className="mt-2 text-sm font-semibold text-[#102033]">
-                    {connectStatusMessage || "Waiting for other device..."}
+                    {connectStatusMessage ||
+                      "Share the offer QR, then scan the answer QR back on this phone."}
                   </p>
+                  <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                    <button
+                      type="button"
+                      onClick={() => void revealCurrentOfferQr()}
+                      className={pressableCardClasses(
+                        "rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
+                      )}
+                    >
+                      Show Offer QR
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        hideSnapshotQr();
+                        setConnectStep("joiner_scan_offer");
+                        setConnectStatusMessage("Scan the offer QR from the first phone.");
+                        openScanner("snapshot");
+                      }}
+                      className={pressableCardClasses(
+                        "rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
+                      )}
+                    >
+                      Scan Answer QR
+                    </button>
+                  </div>
                   <button
                     type="button"
                     onClick={() => {
-                      intentionalCloseRef.current = true;
-                      clearAnswerPolling();
-                      syncChannelRef.current?.close();
-                      offerPeerRef.current?.channel.close();
-                      offerPeerRef.current?.connection.close();
-                      setRoomCode("");
-                      setConnectStatusMessage("");
-                      setConnectStep("pick_role");
+                      hideSnapshotQr();
+                      resetNearbyFlow();
                     }}
                     className={pressableCardClasses(
                       "mt-4 w-full rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
@@ -2262,47 +2017,32 @@ export function NexusApp() {
                 </section>
               )}
 
-              {connectStep === "joiner_enter_code" && (
+              {connectStep === "joiner_scan_offer" && (
                 <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
+                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                    Live Sync
+                  </p>
                   <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                    Enter room code
+                    Scan the first phone
                   </h2>
-                  <input
-                    value={joinRoomCode}
-                    onChange={(event) =>
-                      setJoinRoomCode(
-                        event.target.value
-                          .replace(/\D/g, "")
-                          .slice(0, SIGNAL_ROOM_CODE_LENGTH),
-                      )
-                    }
-                    className={fieldClasses(
-                      "mt-4 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3.5 text-center text-3xl tracking-[0.3em] text-[#102033] outline-none",
-                    )}
-                    inputMode="numeric"
-                    maxLength={SIGNAL_ROOM_CODE_LENGTH}
-                    placeholder="000000"
-                  />
-                  {!!connectStatusMessage && (
-                    <p className="mt-3 text-sm text-[#5a6472]">
-                      {connectStatusMessage}
-                    </p>
-                  )}
+                  <p className="mt-3 text-sm text-[#5a6472]">{connectHint}</p>
+                  <p className="mt-4 text-sm font-semibold text-[#102033]">
+                    {connectStatusMessage}
+                  </p>
                   <button
                     type="button"
-                    onClick={() => void handleJoinerSubmit(joinRoomCode)}
+                    onClick={() => openScanner("snapshot")}
                     className={pressableCardClasses(
                       "mt-4 w-full rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
                     )}
                   >
-                    Connect
+                    Scan Offer QR
                   </button>
                   <button
                     type="button"
                     onClick={() => {
-                      setConnectStep("pick_role");
-                      setJoinRoomCode("");
-                      setConnectStatusMessage("");
+                      resetNearbyFlow();
+                      setScannerMode(null);
                     }}
                     className={pressableCardClasses(
                       "mt-4 rounded-full border border-[#d7cfbe] bg-white px-4 py-2 text-sm font-semibold text-[#102033]",
@@ -2313,11 +2053,47 @@ export function NexusApp() {
                 </section>
               )}
 
+              {connectStep === "joiner_show_answer" && (
+                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-5">
+                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
+                    Live Sync
+                  </p>
+                  <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
+                    Show the answer QR
+                  </h2>
+                  <p className="mt-3 text-sm text-[#5a6472]">{connectHint}</p>
+                  <p className="mt-4 text-sm font-semibold text-[#102033]">
+                    {connectStatusMessage}
+                  </p>
+                  <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                    <button
+                      type="button"
+                      onClick={() => void revealCurrentAnswerQr()}
+                      className={pressableCardClasses(
+                        "rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
+                      )}
+                    >
+                      Show Answer QR
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openScanner("snapshot")}
+                      className={pressableCardClasses(
+                        "rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
+                      )}
+                    >
+                      Re-scan Offer
+                    </button>
+                  </div>
+                </section>
+              )}
+
               {connectStep === "connected" && (
                 <section className="rounded-[1.5rem] border border-emerald-200 bg-emerald-50 p-5">
                   <p className="text-2xl font-semibold text-emerald-900">
                     Connected
                   </p>
+                  <p className="mt-2 text-sm text-emerald-900">{connectHint}</p>
                   <p className="mt-2 text-sm text-emerald-900">{syncText}</p>
                   <button
                     type="button"
@@ -2333,7 +2109,7 @@ export function NexusApp() {
                     onClick={() => {
                       intentionalCloseRef.current = true;
                       syncChannelRef.current?.close();
-                      setConnectStep("pick_role");
+                      resetNearbyFlow();
                     }}
                     className={pressableCardClasses(
                       "mt-3 w-full rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
@@ -2353,7 +2129,7 @@ export function NexusApp() {
                     Scan a snapshot QR
                   </h2>
                   <p className="mt-3 text-sm text-[#5a6472]">
-                    The camera opens in a full-screen scanner overlay.
+                    Use this when live sync is inconvenient or a local-only link fails.
                   </p>
                   <p className="mt-4 text-sm text-[#5a6472]">{scannerStatus}</p>
                   <button
@@ -2416,19 +2192,7 @@ export function NexusApp() {
               </button>
             </div>
 
-            <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-5">
-              <button
-                type="button"
-                onClick={() => setSecuritySection("network")}
-                className={classNames(
-                  "rounded-[1rem] px-3 py-3 text-sm font-semibold transition duration-150 active:scale-[0.98]",
-                  securitySection === "network"
-                    ? "bg-[#102033] text-white"
-                    : "bg-white text-[#102033]",
-                )}
-              >
-                Network
-              </button>
+            <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-4">
               <button
                 type="button"
                 onClick={() => setSecuritySection("profile")}
@@ -2478,24 +2242,6 @@ export function NexusApp() {
                 Debug
               </button>
             </div>
-
-            {securitySection === "network" && (
-              <div className="mt-4 space-y-3">
-                <input
-                  value={networkDraftHost}
-                  onChange={(event) => setNetworkDraftHost(event.target.value)}
-                  className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
-                  placeholder="192.168.1.x:3000"
-                />
-                <button
-                  type="button"
-                  onClick={() => saveSignalingHost(networkDraftHost)}
-                  className="w-full rounded-[1.2rem] bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
-                >
-                  Change Server
-                </button>
-              </div>
-            )}
 
             {securitySection === "profile" && (
               <div className="mt-4 space-y-3">
@@ -2629,7 +2375,16 @@ export function NexusApp() {
                   Camera
                 </p>
                 <h2 className="mt-2 text-2xl font-semibold">
-                  {scannerMode === "snapshot" && "Scan Share QR"}
+                  {scannerMode === "snapshot" &&
+                    connectStep === "initiator_scan_answer" &&
+                    "Scan Answer QR"}
+                  {scannerMode === "snapshot" &&
+                    connectStep === "joiner_scan_offer" &&
+                    "Scan Offer QR"}
+                  {scannerMode === "snapshot" &&
+                    connectStep !== "initiator_scan_answer" &&
+                    connectStep !== "joiner_scan_offer" &&
+                    "Scan Share QR"}
                 </h2>
               </div>
               <button
@@ -2656,7 +2411,7 @@ export function NexusApp() {
         </div>
       )}
 
-      {snapshotQrUrl && snapshotQrTitle === "Share QR" && (
+      {snapshotQrUrl && (
         <div className="fixed inset-0 z-50 bg-[#f6f2e8] px-4 py-6">
           <div className="mx-auto flex h-full w-full max-w-2xl flex-col items-center justify-center">
             <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#945f3d]">
@@ -2791,7 +2546,7 @@ export function NexusApp() {
                         ...current,
                         lastSnapshotPayload: snapshot.qr,
                       }));
-                      await showSnapshotQr(
+                      await showTransportQr(
                         "Share QR",
                         "Share this message with another phone.",
                         snapshot.qr,

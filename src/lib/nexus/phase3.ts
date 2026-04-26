@@ -87,14 +87,9 @@ export interface PeerArtifacts {
   channel: RTCDataChannel;
 }
 
-const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-];
-
 function createPeerConnection(): RTCPeerConnection {
   return new RTCPeerConnection({
-    iceServers: DEFAULT_ICE_SERVERS,
+    iceServers: [],
     iceCandidatePoolSize: 4,
   });
 }
