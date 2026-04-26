@@ -454,8 +454,8 @@ export function NexusApp() {
       window.localStorage.getItem(INSTALL_BANNER_DISMISSED_KEY) === "true";
 
     const handleBeforeInstallPrompt = (event: Event) => {
-      event.preventDefault();
       if (dismissed) return;
+      event.preventDefault();
       setInstallPromptEvent(event as BeforeInstallPromptEvent);
       setInstallBannerVisible(true);
     };
