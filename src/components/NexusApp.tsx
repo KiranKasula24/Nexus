@@ -1111,9 +1111,24 @@ export function NexusApp() {
               return;
             }
 
-            await finalizeInitiator(offerPeerRef.current.connection, answerSdp);
-          } catch {
-            setConnectStatusMessage("Waiting for other device...");
+            try {
+              await finalizeInitiator(
+                offerPeerRef.current.connection,
+                answerSdp,
+              );
+            } catch (error) {
+              setConnectStatusMessage(
+                error instanceof Error
+                  ? error.message
+                  : "Could not finalize peer connection.",
+              );
+            }
+          } catch (error) {
+            setConnectStatusMessage(
+              error instanceof Error
+                ? error.message
+                : "Waiting for other device...",
+            );
           }
         })();
       }, 2_000);

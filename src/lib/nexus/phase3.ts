@@ -107,14 +107,49 @@ async function waitForIceGatheringComplete(
   }
 
   await new Promise<void>((resolve) => {
-    const listener = (): void => {
+    let settled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      connection.removeEventListener(
+        "icegatheringstatechange",
+        handleGatheringStateChange,
+      );
+      connection.removeEventListener("icecandidate", handleIceCandidate);
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      resolve();
+    };
+
+    const handleGatheringStateChange = (): void => {
       if (connection.iceGatheringState === "complete") {
-        connection.removeEventListener("icegatheringstatechange", listener);
-        resolve();
+        finish();
       }
     };
 
-    connection.addEventListener("icegatheringstatechange", listener);
+    const handleIceCandidate = (event: RTCPeerConnectionIceEvent): void => {
+      if (!event.candidate) {
+        finish();
+      }
+    };
+
+    connection.addEventListener(
+      "icegatheringstatechange",
+      handleGatheringStateChange,
+    );
+    connection.addEventListener("icecandidate", handleIceCandidate);
+
+    if (connection.iceGatheringState === "complete") {
+      finish();
+      return;
+    }
+
+    timeoutId = setTimeout(() => {
+      finish();
+    }, 4_000);
   });
 }
 
