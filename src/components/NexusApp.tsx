@@ -465,7 +465,10 @@ export function NexusApp() {
     }
 
     if (!response.ok) {
-      throw new Error(`Failed to publish ${role} for room ${room} at ${url}.`);
+      const body = await response.text();
+      throw new Error(
+        `Failed to publish ${role} for room ${room} at ${url}. Status ${response.status}. ${body}`,
+      );
     }
   }
 
@@ -483,7 +486,10 @@ export function NexusApp() {
     }
 
     if (!response.ok) {
-      throw new Error(`Failed to read ${role} for room ${room} at ${url}.`);
+      const body = await response.text();
+      throw new Error(
+        `Failed to read ${role} for room ${room} at ${url}. Status ${response.status}. ${body}`,
+      );
     }
 
     const payload = (await response.json()) as { sdp: string | null };
