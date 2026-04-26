@@ -11,6 +11,7 @@ export interface NexusMessage {
   hop_count: number;
   weight: number;
   payload: string;
+  crucial_topics?: string[];
   confidence: Confidence;
   supersedes?: string;
   superseded_by?: string;

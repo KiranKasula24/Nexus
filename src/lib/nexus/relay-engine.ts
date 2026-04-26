@@ -1,5 +1,6 @@
 import { mergeSupersedes } from "./phase2";
 import { BloomFilter, selectMessagesNotInBloom } from "./phase4";
+import { prioritizeMessagesForProfile, type NexusUserProfile } from "./profile";
 import type { NexusRepository } from "./repository";
 import { computeFields, sortByScoreDesc } from "./scoring";
 import type { NexusMessage, NexusMessageWithComputed } from "./types";
@@ -18,12 +19,14 @@ export async function rankStoredMessages(
 export async function selectRelayMessages(
   repository: NexusRepository,
   peerBloom?: BloomFilter,
+  peerProfile?: NexusUserProfile,
 ): Promise<RelaySelection> {
   const rankedMessages = await repository.getAll();
   const rawMessages = await repository.getAllRaw();
-  const selectedMessages = peerBloom
+  const baseline = peerBloom
     ? selectMessagesNotInBloom(rawMessages, peerBloom)
     : sortByScoreDesc(rawMessages);
+  const selectedMessages = prioritizeMessagesForProfile(baseline, peerProfile);
 
   return {
     rankedMessages,

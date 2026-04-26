@@ -7,6 +7,7 @@ export interface CreateMessageInput {
   type: MessageType;
   priority: 1 | 2 | 3 | 4 | 5;
   payload: string;
+  crucial_topics?: string[];
   ttlHours?: number;
   confidence?: Confidence;
   supersedes?: string;
@@ -24,7 +25,8 @@ export async function createMessage(
   const ttlHours = input.ttlHours ?? DEFAULT_TTL_HOURS[input.type];
   const ttl = floorToHour(createdAt + ttlHours * 3600);
 
-  const idSource = `${input.type}${createdAt}${input.payload}`;
+  const topics = [...(input.crucial_topics ?? [])].sort().join("|");
+  const idSource = `${input.type}${createdAt}${input.payload}${topics}`;
   const id = await sha256Hex16(idSource);
 
   return {
@@ -36,6 +38,7 @@ export async function createMessage(
     hop_count: 0,
     weight: 1,
     payload: input.payload,
+    crucial_topics: input.crucial_topics,
     confidence: input.confidence ?? defaultConfidence(input.type),
     supersedes: input.supersedes,
     schema_version: 1,

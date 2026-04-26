@@ -13,6 +13,8 @@ import {
   NexusRepository,
   QUARANTINE_KEY,
   requestMotionPermissionIfNeeded,
+  parseCommaSeparatedList,
+  normalizeStringList,
   runComposePipeline,
   runLevel3Wipe,
   runPeerReceivePipeline,
@@ -24,6 +26,8 @@ import {
   SCORING_INTERVAL_MS,
   startCameraScanner,
   submitPinAttempt,
+  USER_PROFILE_KEY,
+  type NexusUserProfile,
   type MessageType,
   type NexusMessage,
   type NexusMessageWithComputed,
@@ -32,19 +36,22 @@ import {
 } from "@/lib/nexus";
 
 type Section = "relay" | "compose" | "connect";
-type ScannerMode = "snapshot" | "offer" | "answer";
+type ScannerMode = "snapshot";
 type StatusTone = "ready" | "active" | "warning" | "danger";
 type PeerState = "idle" | "connecting" | "connected" | "disconnected";
 type ConnectStep =
   | "pick_role"
-  | "sender_offer"
-  | "sender_scan_answer"
-  | "receiver_scan_offer"
-  | "receiver_show_answer"
+  | "initiator_show_code"
+  | "joiner_enter_code"
   | "connected"
   | "snapshot_scan";
 type SyncWire =
-  | { type: "BLOOM_OFFER"; bloom: string; messageCount: number }
+  | {
+      type: "BLOOM_OFFER";
+      bloom: string;
+      messageCount: number;
+      profile?: NexusUserProfile;
+    }
   | { type: "MSG_PUSH"; message: NexusMessage }
   | { type: "SYNC_DONE"; sentCount: number };
 
@@ -71,7 +78,12 @@ interface DevState {
   syncStats: SyncStats;
 }
 
-function classNames(...parts: Array<string | false | null | undefined>): string {
+const SIGNALING_HOST_KEY = "nexus_signaling_host";
+const DEFAULT_SIGNALING_HOST = "10.70.51.133:3000";
+
+function classNames(
+  ...parts: Array<string | false | null | undefined>
+): string {
   return parts.filter(Boolean).join(" ");
 }
 
@@ -86,7 +98,9 @@ function toneClasses(tone: StatusTone): string {
   return "bg-slate-100 text-slate-800";
 }
 
-function temperatureDot(temperature: NexusMessageWithComputed["temperature"]): string {
+function temperatureDot(
+  temperature: NexusMessageWithComputed["temperature"],
+): string {
   if (temperature === "hot") return "bg-rose-500";
   if (temperature === "warm") return "bg-amber-400";
   return "bg-slate-400";
@@ -143,22 +157,12 @@ function toRawMessage(message: NexusMessageWithComputed): NexusMessage {
     hop_count: message.hop_count,
     weight: message.weight,
     payload: message.payload,
+    crucial_topics: message.crucial_topics,
     confidence: message.confidence,
     supersedes: message.supersedes,
     superseded_by: message.superseded_by,
     schema_version: message.schema_version,
   };
-}
-
-function peerStatusCopy(peerState: PeerState): string {
-  if (peerState === "connecting") return "Connecting…";
-  if (peerState === "connected") {
-    return "Connected. Messages sync automatically every 15 seconds.";
-  }
-  if (peerState === "disconnected") {
-    return "Disconnected. Use the reconnect QR to restore the link.";
-  }
-  return "Both phones must be on the same hotspot. Phone 1 makes the first QR. Phone 2 scans it and shows a second QR. Phone 1 scans that.";
 }
 
 export function NexusApp() {
@@ -171,14 +175,17 @@ export function NexusApp() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const offerPeerRef = useRef<PeerArtifacts | null>(null);
   const joinerPeerRef = useRef<PeerArtifacts | null>(null);
-  const handleSyncWireRef = useRef<
-    ((raw: string) => Promise<void>) | null
-  >(null);
+  const answerPollingRef = useRef<number | null>(null);
+  const answerPollingDeadlineRef = useRef<number | null>(null);
+  const handleSyncWireRef = useRef<((raw: string) => Promise<void>) | null>(
+    null,
+  );
   const handleScannedPayloadRef = useRef<
-    ((decoded: string, mode: ScannerMode) => Promise<void>) | null
+    ((decoded: string) => Promise<void>) | null
   >(null);
 
   const [messages, setMessages] = useState<NexusMessageWithComputed[]>([]);
+  const [mounted, setMounted] = useState(false);
   const [section, setSection] = useState<Section>("relay");
   const [selectedMessage, setSelectedMessage] =
     useState<NexusMessageWithComputed | null>(null);
@@ -186,21 +193,35 @@ export function NexusApp() {
   const [draftPriority, setDraftPriority] = useState<1 | 2 | 3 | 4 | 5>(4);
   const [draftType, setDraftType] = useState<MessageType>("text");
   const [draftSupersedes, setDraftSupersedes] = useState<string | undefined>();
+  const [draftTopicsInput, setDraftTopicsInput] = useState("");
+
+  const [userProfile, setUserProfile] = useState<NexusUserProfile | null>(null);
+  const [profileSetupOpen, setProfileSetupOpen] = useState(false);
+  const [profilePrefsInput, setProfilePrefsInput] = useState("");
+  const [profileRequirementsInput, setProfileRequirementsInput] = useState("");
+  const [profileTopicsInput, setProfileTopicsInput] = useState("");
 
   const [statusTone, setStatusTone] = useState<StatusTone>("ready");
   const [statusText, setStatusText] = useState("Ready");
-  const [syncText, setSyncText] = useState("Join the same hotspot, then connect");
+  const [syncText, setSyncText] = useState(
+    "Join the same hotspot, then connect",
+  );
   const [scannerStatus, setScannerStatus] = useState("Scanner idle");
   const [storageWarning, setStorageWarning] = useState("");
   const [peerState, setPeerState] = useState<PeerState>("idle");
   const [sharePanelOpen, setSharePanelOpen] = useState(false);
   const [selectedShareIds, setSelectedShareIds] = useState<string[]>([]);
-  const [reconnectOfferToken, setReconnectOfferToken] = useState("");
+  const [reconnectRoomCode, setReconnectRoomCode] = useState("");
   const [showReconnectBanner, setShowReconnectBanner] = useState(false);
+  const [signalingHost, setSignalingHost] = useState(DEFAULT_SIGNALING_HOST);
+  const [signalingHostConfirmed, setSignalingHostConfirmed] = useState(true);
+  const [networkDraftHost, setNetworkDraftHost] = useState(
+    DEFAULT_SIGNALING_HOST,
+  );
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [securitySection, setSecuritySection] = useState<
-    "security" | "emergency" | "developer"
+    "security" | "emergency" | "developer" | "profile" | "network"
   >("security");
   const [pinSetup, setPinSetup] = useState("123456");
   const [pinAttempt, setPinAttempt] = useState("123456");
@@ -216,12 +237,16 @@ export function NexusApp() {
 
   const [scannerMode, setScannerMode] = useState<ScannerMode | null>(null);
   const [connectStep, setConnectStep] = useState<ConnectStep>("pick_role");
-  const [connectQrUrl, setConnectQrUrl] = useState<string>("");
-  const [activeQrUrl, setActiveQrUrl] = useState("");
-  const [activeQrTitle, setActiveQrTitle] = useState("");
-  const [activeQrDetail, setActiveQrDetail] = useState("");
-  const [activeQrStatus, setActiveQrStatus] =
-    useState<{ tone: StatusTone; label: string } | null>(null);
+  const [roomCode, setRoomCode] = useState("");
+  const [joinRoomCode, setJoinRoomCode] = useState("");
+  const [connectStatusMessage, setConnectStatusMessage] = useState("");
+  const [snapshotQrUrl, setSnapshotQrUrl] = useState("");
+  const [snapshotQrTitle, setSnapshotQrTitle] = useState("");
+  const [snapshotQrDetail, setSnapshotQrDetail] = useState("");
+  const [snapshotQrStatus, setSnapshotQrStatus] = useState<{
+    tone: StatusTone;
+    label: string;
+  } | null>(null);
 
   const topHotCount = useMemo(
     () => messages.filter((message) => message.temperature === "hot").length,
@@ -241,13 +266,19 @@ export function NexusApp() {
   );
 
   useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
     if (messages.length === 0) {
       setSelectedShareIds([]);
       return;
     }
 
     setSelectedShareIds((current) => {
-      const existing = current.filter((id) => messages.some((message) => message.id === id));
+      const existing = current.filter((id) =>
+        messages.some((message) => message.id === id),
+      );
       if (existing.length > 0) {
         return existing;
       }
@@ -256,22 +287,13 @@ export function NexusApp() {
   }, [messages]);
 
   useEffect(() => {
-    if (connectStep === "receiver_scan_offer") {
-      setScannerMode("offer");
-    } else if (connectStep === "sender_scan_answer") {
-      setScannerMode("answer");
-    }
-  }, [connectStep]);
-
-  useEffect(() => {
     if (section !== "connect") {
       setConnectStep("pick_role");
-      setConnectQrUrl("");
-      if (scannerMode === "offer" || scannerMode === "answer") {
-        setScannerMode(null);
-      }
+      setRoomCode("");
+      setJoinRoomCode("");
+      setConnectStatusMessage("");
     }
-  }, [section, scannerMode]);
+  }, [section]);
 
   function pushDevLog(tone: StatusTone, title: string, detail: string): void {
     setDevState((current) => ({
@@ -325,16 +347,92 @@ export function NexusApp() {
     await refreshQuarantineCount();
   }
 
-  function noteStatus(
-    tone: StatusTone,
-    label: string,
-    detail?: string,
-  ): void {
+  function noteStatus(tone: StatusTone, label: string, detail?: string): void {
     setStatusTone(tone);
     setStatusText(label);
     if (detail) {
       pushDevLog(tone, label, detail);
     }
+  }
+
+  function normalizeHostInput(value: string): string {
+    return value
+      .trim()
+      .replace(/^https?:\/\//i, "")
+      .replace(/\/$/, "");
+  }
+
+  function buildSignalUrl(room: string, role?: "offer" | "answer"): string {
+    const base = `http://${signalingHost}/api/signal/${room}`;
+    if (!role) return base;
+    return `${base}?role=${role}`;
+  }
+
+  function clearAnswerPolling(): void {
+    if (answerPollingRef.current) {
+      window.clearInterval(answerPollingRef.current);
+      answerPollingRef.current = null;
+    }
+    answerPollingDeadlineRef.current = null;
+  }
+
+  async function postSignal(
+    room: string,
+    role: "offer" | "answer",
+    sdp: string,
+  ): Promise<void> {
+    const url = buildSignalUrl(room);
+    console.log("postSignal URL:", url);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role, sdp }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to publish ${role} for room ${room}.`);
+    }
+  }
+
+  async function getSignal(
+    room: string,
+    role: "offer" | "answer",
+  ): Promise<string | null> {
+    const response = await fetch(buildSignalUrl(room, role));
+    if (!response.ok) {
+      throw new Error(`Failed to read ${role} for room ${room}.`);
+    }
+
+    const payload = (await response.json()) as { sdp: string | null };
+    return payload.sdp;
+  }
+
+  async function showSnapshotQr(
+    title: string,
+    detail: string,
+    payload: string,
+    status: { tone: StatusTone; label: string } | null,
+  ): Promise<void> {
+    setSnapshotQrTitle(title);
+    setSnapshotQrDetail(detail);
+    setSnapshotQrStatus(status);
+    setSnapshotQrUrl(await buildQrDataUrl(payload));
+  }
+
+  function hideSnapshotQr(): void {
+    setSnapshotQrTitle("");
+    setSnapshotQrDetail("");
+    setSnapshotQrStatus(null);
+    setSnapshotQrUrl("");
+  }
+
+  function saveSignalingHost(rawHost: string): void {
+    const host = normalizeHostInput(rawHost);
+    if (!host) return;
+    localStorage.setItem(SIGNALING_HOST_KEY, host);
+    setSignalingHost(host);
+    setNetworkDraftHost(host);
+    setSignalingHostConfirmed(true);
   }
 
   useEffect(() => {
@@ -343,6 +441,26 @@ export function NexusApp() {
 
     const hydrate = async (): Promise<void> => {
       setMessages(await repository.getAll());
+
+      const saved = localStorage.getItem(SIGNALING_HOST_KEY);
+      const host = normalizeHostInput(saved || DEFAULT_SIGNALING_HOST);
+      setSignalingHost(host);
+      setNetworkDraftHost(host);
+      setSignalingHostConfirmed(true);
+
+      const storedProfile =
+        await repository.getSystemState<NexusUserProfile>(USER_PROFILE_KEY);
+      if (storedProfile) {
+        setUserProfile(storedProfile);
+        setProfilePrefsInput(storedProfile.preferences.join(", "));
+        setProfileRequirementsInput(storedProfile.requirements);
+        setProfileTopicsInput(storedProfile.crucialTopics.join(", "));
+        setDraftTopicsInput(storedProfile.crucialTopics.join(", "));
+      } else {
+        setProfileSetupOpen(true);
+        setStatusTone("warning");
+        setStatusText("Set profile to start smart sync");
+      }
 
       const storedPinHash = await loadPinHash(repository);
       if (storedPinHash) {
@@ -372,6 +490,7 @@ export function NexusApp() {
 
     return () => {
       intentionalCloseRef.current = true;
+      clearAnswerPolling();
       stopScoring();
       stopSweep();
       scannerStopRef.current?.();
@@ -391,14 +510,13 @@ export function NexusApp() {
     if (!scannerMode || !videoRef.current) return undefined;
 
     let active = true;
-    const mode = scannerMode;
     setScannerStatus("Opening camera");
 
     void startCameraScanner(videoRef.current, (decoded) => {
       if (!active) return;
       setScannerMode(null);
       setScannerStatus("QR captured");
-      void handleScannedPayloadRef.current?.(decoded, mode);
+      void handleScannedPayloadRef.current?.(decoded);
     })
       .then((stop) => {
         if (!active) {
@@ -422,25 +540,6 @@ export function NexusApp() {
     };
   }, [scannerMode]);
 
-  async function openQr(
-    title: string,
-    detail: string,
-    payload: string,
-    status: { tone: StatusTone; label: string } | null,
-  ): Promise<void> {
-    setActiveQrTitle(title);
-    setActiveQrDetail(detail);
-    setActiveQrStatus(status);
-    setActiveQrUrl(await buildQrDataUrl(payload));
-  }
-
-  function closeQr(): void {
-    setActiveQrTitle("");
-    setActiveQrDetail("");
-    setActiveQrStatus(null);
-    setActiveQrUrl("");
-  }
-
   function queueDeveloperUnlock(): void {
     setSettingsOpen(true);
     setSecuritySection("developer");
@@ -452,6 +551,7 @@ export function NexusApp() {
       setDraftPriority(message.priority);
       setDraftType(message.type);
       setDraftSupersedes(message.id);
+      setDraftTopicsInput((message.crucial_topics ?? []).join(", "));
       setSelectedMessage(null);
       noteStatus(
         "warning",
@@ -463,8 +563,54 @@ export function NexusApp() {
       setDraftPriority(4);
       setDraftType("text");
       setDraftSupersedes(undefined);
+      setDraftTopicsInput((userProfile?.crucialTopics ?? []).join(", "));
     }
     setSection("compose");
+  }
+
+  function addDraftTopic(topic: string): void {
+    const current = parseCommaSeparatedList(draftTopicsInput);
+    const next = normalizeStringList([...current, topic]);
+    setDraftTopicsInput(next.join(", "));
+  }
+
+  async function handleSaveProfile(): Promise<void> {
+    if (!repositoryRef.current) return;
+
+    const preferences = parseCommaSeparatedList(profilePrefsInput);
+    const crucialTopics = parseCommaSeparatedList(profileTopicsInput);
+    const requirements = profileRequirementsInput.trim();
+
+    if (
+      preferences.length === 0 &&
+      crucialTopics.length === 0 &&
+      requirements.length === 0
+    ) {
+      noteStatus(
+        "warning",
+        "Set at least one preference",
+        "Add preferences, requirements, or crucial topics before continuing.",
+      );
+      return;
+    }
+
+    const now = Date.now();
+    const nextProfile: NexusUserProfile = {
+      preferences,
+      requirements,
+      crucialTopics,
+      createdAt: userProfile?.createdAt ?? now,
+      updatedAt: now,
+    };
+
+    await repositoryRef.current.setSystemState(USER_PROFILE_KEY, nextProfile);
+    setUserProfile(nextProfile);
+    setProfileSetupOpen(false);
+    noteStatus(
+      "active",
+      "Profile saved",
+      "Preferences and requirements are now used for hotspot and QR sharing.",
+    );
   }
 
   async function handleSaveDraft(): Promise<void> {
@@ -477,6 +623,7 @@ export function NexusApp() {
       type: draftType,
       priority: draftPriority,
       payload: draftText.trim(),
+      crucial_topics: parseCommaSeparatedList(draftTopicsInput),
       supersedes: draftSupersedes,
     });
 
@@ -488,12 +635,15 @@ export function NexusApp() {
 
     noteStatus(
       result.message ? "active" : "warning",
-      result.message ? "Message stored on this device" : "Duplicate message skipped",
+      result.message
+        ? "Message stored on this device"
+        : "Duplicate message skipped",
       result.run.summary,
     );
 
     setDraftText("");
     setDraftSupersedes(undefined);
+    setDraftTopicsInput((userProfile?.crucialTopics ?? []).join(", "));
     setSection("relay");
   }
 
@@ -516,6 +666,7 @@ export function NexusApp() {
       const result = await runSnapshotSharePipeline(
         repositoryRef.current,
         selectedShareMessages.map(toRawMessage),
+        userProfile ?? undefined,
       );
       recordPipelineRun(result.run);
       const snapshot = result.snapshot;
@@ -527,7 +678,7 @@ export function NexusApp() {
         ...current,
         lastSnapshotPayload: snapshot.qr,
       }));
-      await openQr(
+      await showSnapshotQr(
         "Share QR",
         "Share the messages you picked with another phone.",
         snapshot.qr,
@@ -536,11 +687,7 @@ export function NexusApp() {
           `Packed ${snapshot.count} message${snapshot.count === 1 ? "" : "s"}`,
         ),
       );
-      noteStatus(
-        "active",
-        "QR ready",
-        result.run.summary,
-      );
+      noteStatus("active", "QR ready", result.run.summary);
     } catch (error) {
       noteStatus(
         "danger",
@@ -550,10 +697,7 @@ export function NexusApp() {
   }
 
   async function sendBloomOffer(channel: RTCDataChannel): Promise<void> {
-    if (
-      channel.readyState === "closing" ||
-      channel.readyState === "closed"
-    ) {
+    if (channel.readyState === "closing" || channel.readyState === "closed") {
       if (syncTimerRef.current) {
         window.clearInterval(syncTimerRef.current);
         syncTimerRef.current = null;
@@ -571,6 +715,7 @@ export function NexusApp() {
         type: "BLOOM_OFFER",
         bloom: bloom.toBase64(),
         messageCount: local.length,
+        profile: userProfile ?? undefined,
       } satisfies SyncWire),
     );
 
@@ -641,28 +786,14 @@ export function NexusApp() {
       setPeerState("connected");
       setConnectStep("connected");
       setShowReconnectBanner(false);
-      setReconnectOfferToken("");
+      setReconnectRoomCode("");
+      clearAnswerPolling();
       setSyncText("Connected. Sharing can continue in the background.");
       noteStatus(
         "active",
         "Connected",
         "The phones are linked on the same hotspot.",
       );
-      const lastOffer = sessionStorage.getItem("nexus_last_offer") ?? "";
-      const lastAnswer = sessionStorage.getItem("nexus_last_answer") ?? "";
-      if (lastOffer) {
-        sessionStorage.setItem("nexus_last_offer", lastOffer);
-      }
-      if (lastAnswer) {
-        sessionStorage.setItem("nexus_last_answer", lastAnswer);
-      }
-
-      if (activeQrTitle.startsWith("Step")) {
-        setActiveQrStatus(formatRelativeTone("active", "Peer connected"));
-        setActiveQrDetail(
-          "The phones are linked. You can close this screen and keep sharing in the background.",
-        );
-      }
 
       void sendBloomOffer(peer.channel);
 
@@ -690,44 +821,27 @@ export function NexusApp() {
       }
       setPeerState("disconnected");
       setConnectStep("pick_role");
-      setConnectQrUrl("");
+      setRoomCode("");
+      setJoinRoomCode("");
       setSyncText("Peer disconnected. Ready for the next encounter.");
       noteStatus(
         "warning",
         "Disconnected",
         "The link closed. Messages stay on this phone.",
       );
-      if (activeQrTitle.startsWith("Step")) {
-        setActiveQrStatus(formatRelativeTone("warning", "Peer disconnected"));
-      }
+
+      clearAnswerPolling();
 
       if (!intentionalCloseRef.current) {
-        const lastOffer = sessionStorage.getItem("nexus_last_offer");
-        if (lastOffer) {
-          void createInitiator()
-            .then(async (result) => {
-              await attachPeer(result.peer, "initiator");
-              sessionStorage.setItem("nexus_last_offer", result.offerToken);
-              setDevState((current) => ({
-                ...current,
-                lastOfferToken: result.offerToken,
-              }));
-              setReconnectOfferToken(result.offerToken);
-              setShowReconnectBanner(true);
-              setConnectQrUrl(await buildQrDataUrl(result.offerToken));
-              setActiveQrStatus(
-                formatRelativeTone("warning", "Reconnecting - scan again"),
-              );
-              setActiveQrTitle("Step 1 QR");
-            })
-            .catch((error: unknown) => {
-              pushDevLog(
-                "warning",
-                "Reconnect failed",
-                error instanceof Error ? error.message : "Could not build reconnect QR.",
-              );
-            });
-        }
+        void handleStartInitiator(true).catch((error: unknown) => {
+          pushDevLog(
+            "warning",
+            "Reconnect failed",
+            error instanceof Error
+              ? error.message
+              : "Could not create reconnect room.",
+          );
+        });
       }
     };
 
@@ -760,6 +874,7 @@ export function NexusApp() {
       const result = await runPeerSendSelectionPipeline(
         repositoryRef.current,
         wire.bloom,
+        wire.profile,
       );
       const queue = result.messages;
       recordPipelineRun(result.run);
@@ -816,21 +931,10 @@ export function NexusApp() {
           ? `Connected. Sent ${wire.sentCount} top message${wire.sentCount === 1 ? "" : "s"}.`
           : "Connected. The other phone already has the latest messages.",
       );
-      if (activeQrTitle.startsWith("Step")) {
-        setActiveQrStatus(
-          formatRelativeTone(
-            "active",
-            wire.sentCount > 0 ? "Sync complete" : "Already aligned",
-          ),
-        );
-      }
     }
   }
 
-  async function handleScannedPayload(
-    decoded: string,
-    mode: ScannerMode,
-  ): Promise<void> {
+  async function handleScannedPayload(decoded: string): Promise<void> {
     if (!repositoryRef.current) return;
 
     try {
@@ -851,51 +955,6 @@ export function NexusApp() {
         return;
       }
 
-      if (decoded.startsWith("W")) {
-        if (mode === "answer" && offerPeerRef.current) {
-          await finalizeInitiator(offerPeerRef.current.connection, decoded);
-          sessionStorage.setItem("nexus_last_answer", decoded);
-          setScannerMode(null);
-          setSyncText("Answer scanned. Waiting to connect.");
-          if (activeQrTitle === "Step 1 QR") {
-            setActiveQrStatus(
-              formatRelativeTone("warning", "Answer received"),
-            );
-            setActiveQrDetail(
-              "The answer was scanned. Keep this screen open while the phones connect.",
-            );
-          }
-          pushDevLog(
-            "active",
-            "Answer scanned",
-            "Phone 1 accepted the answer code.",
-          );
-          return;
-        }
-
-        const joiner = await createJoiner(decoded);
-        await attachPeer(joiner.peer, "joiner");
-        sessionStorage.setItem("nexus_last_offer", decoded);
-        sessionStorage.setItem("nexus_last_answer", joiner.answerToken);
-        setConnectStep("receiver_show_answer");
-        setScannerMode(null);
-        setDevState((current) => ({
-          ...current,
-          lastAnswerToken: joiner.answerToken,
-        }));
-        setConnectQrUrl(await buildQrDataUrl(joiner.answerToken));
-        setActiveQrStatus(formatRelativeTone("warning", "Waiting for Phone 1"));
-        setActiveQrTitle("Step 2 QR");
-        setActiveQrDetail("The first phone scans this to complete the connection.");
-        setSyncText("Step 2 ready. Show this code to Phone 1.");
-        pushDevLog(
-          "active",
-          "Step 2 ready",
-          "Phone 2 scanned the first code and made the second code.",
-        );
-        return;
-      }
-
       noteStatus("warning", "Unsupported QR payload kind");
     } catch (error) {
       noteStatus(
@@ -905,30 +964,123 @@ export function NexusApp() {
     }
   }
 
-  async function handleCreateOffer(): Promise<void> {
+  async function handleStartInitiator(isReconnect = false): Promise<void> {
+    if (!signalingHost) {
+      setConnectStatusMessage("Set the network server host first.");
+      setSettingsOpen(true);
+      setSecuritySection("network");
+      return;
+    }
+
+    clearAnswerPolling();
+
+    const generatedRoom = Math.floor(1000 + Math.random() * 9000).toString();
+    setRoomCode(generatedRoom);
+    setConnectStatusMessage("Waiting for other device...");
+    setConnectStep("initiator_show_code");
+    setSection("connect");
+
     const result = await createInitiator();
     await attachPeer(result.peer, "initiator");
-    sessionStorage.setItem("nexus_last_offer", result.offerToken);
-    setConnectStep("sender_offer");
 
     setDevState((current) => ({
       ...current,
       lastOfferToken: result.offerToken,
     }));
 
-    setConnectQrUrl(await buildQrDataUrl(result.offerToken));
-    setActiveQrTitle("Step 1 QR");
-    setActiveQrDetail(
-      "Keep this screen open. The other phone scans this, then shows you a second QR.",
-    );
-    setActiveQrStatus(formatRelativeTone("warning", "Waiting for Phone 2"));
+    await postSignal(generatedRoom, "offer", result.offerToken);
 
-    setSyncText("Step 1 ready. Phone 2 should scan this first.");
+    answerPollingDeadlineRef.current = Date.now() + 120_000;
+    answerPollingRef.current = window.setInterval(() => {
+      if (
+        !answerPollingDeadlineRef.current ||
+        Date.now() > answerPollingDeadlineRef.current
+      ) {
+        clearAnswerPolling();
+        setConnectStatusMessage("Timed out waiting for other device.");
+        return;
+      }
+
+      void (async () => {
+        try {
+          const answerSdp = await getSignal(generatedRoom, "answer");
+          if (!answerSdp) return;
+
+          clearAnswerPolling();
+          setConnectStatusMessage("Answer received, connecting...");
+
+          if (!offerPeerRef.current) {
+            setConnectStatusMessage("Offer session expired. Start again.");
+            return;
+          }
+
+          await finalizeInitiator(offerPeerRef.current.connection, answerSdp);
+        } catch {
+          setConnectStatusMessage("Waiting for other device...");
+        }
+      })();
+    }, 2_000);
+
+    if (isReconnect) {
+      setReconnectRoomCode(generatedRoom);
+      setShowReconnectBanner(true);
+      setConnectStatusMessage("Waiting for other device...");
+    } else {
+      setShowReconnectBanner(false);
+      setReconnectRoomCode("");
+    }
+
+    setSyncText("Share the room code with the other device.");
     pushDevLog(
       "active",
-      "Step 1 ready",
-      "Phone 1 made the first connection code.",
+      isReconnect ? "Reconnect room created" : "Room created",
+      `Created room ${generatedRoom} and published offer token.`,
     );
+  }
+
+  async function handleJoinerSubmit(enteredCode: string): Promise<void> {
+    if (!signalingHost) {
+      setConnectStatusMessage("Set the network server host first.");
+      return;
+    }
+
+    const room = enteredCode.trim();
+    if (!/^\d{4}$/.test(room)) {
+      setConnectStatusMessage("Enter a valid 4-digit room code.");
+      return;
+    }
+
+    setConnectStatusMessage("Checking room...");
+
+    try {
+      const offerSdp = await getSignal(room, "offer");
+      if (!offerSdp) {
+        setConnectStatusMessage(
+          "Room not found. Check the code and try again.",
+        );
+        return;
+      }
+
+      const joiner = await createJoiner(offerSdp);
+      await attachPeer(joiner.peer, "joiner");
+      await postSignal(room, "answer", joiner.answerToken);
+
+      setDevState((current) => ({
+        ...current,
+        lastAnswerToken: joiner.answerToken,
+      }));
+
+      setConnectStatusMessage("Answer sent. Connecting...");
+      setConnectStep("connected");
+      setSyncText("Connection handshake completed. Waiting for WebRTC link.");
+      pushDevLog("active", "Joined room", `Submitted answer for room ${room}.`);
+    } catch (error) {
+      setConnectStatusMessage(
+        error instanceof Error
+          ? error.message
+          : "Could not join room. Try again.",
+      );
+    }
   }
 
   async function handleSavePin(): Promise<void> {
@@ -1037,6 +1189,91 @@ export function NexusApp() {
     handleScannedPayloadRef.current = handleScannedPayload;
   });
 
+  if (!mounted) return null;
+
+  if (!signalingHostConfirmed) {
+    return (
+      <main className="flex min-h-screen items-center justify-center px-4 py-8">
+        <section className="w-full max-w-xl rounded-[2rem] border border-[#ddd1be] bg-[#f8f4eb] p-6 shadow-[0_20px_80px_rgba(16,32,51,0.12)]">
+          <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#945f3d]">
+            Network Setup
+          </p>
+          <h1 className="mt-3 text-3xl font-semibold text-[#102033]">
+            Network Setup
+          </h1>
+          <p className="mt-2 text-sm text-[#5a6472]">
+            Enter the address of the device running the Nexus server on your
+            local network. This is only used to establish connections - no
+            messages are sent to this address.
+          </p>
+          <input
+            value={networkDraftHost}
+            onChange={(event) => setNetworkDraftHost(event.target.value)}
+            className="mt-6 w-full rounded-2xl border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+            placeholder="192.168.1.x:3000"
+          />
+          <button
+            type="button"
+            onClick={() => saveSignalingHost(networkDraftHost)}
+            className="mt-4 w-full rounded-2xl bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
+          >
+            Save and Continue
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  if (profileSetupOpen) {
+    return (
+      <main className="flex min-h-screen items-center justify-center px-4 py-8">
+        <section className="w-full max-w-xl rounded-[2rem] border border-[#ddd1be] bg-[#f8f4eb] p-6 shadow-[0_20px_80px_rgba(16,32,51,0.12)]">
+          <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#945f3d]">
+            Setup
+          </p>
+          <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
+            Tell Nexus your priorities
+          </h2>
+          <p className="mt-2 text-sm text-[#5a6472]">
+            These preferences and requirements are exchanged during hotspot
+            pairing and used to prioritize what data is sent first.
+          </p>
+
+          <div className="mt-4 space-y-3">
+            <input
+              value={profilePrefsInput}
+              onChange={(event) => setProfilePrefsInput(event.target.value)}
+              className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+              placeholder="Preferences (comma separated): water, medicine"
+            />
+            <textarea
+              value={profileRequirementsInput}
+              onChange={(event) =>
+                setProfileRequirementsInput(event.target.value)
+              }
+              className="h-24 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+              placeholder="Requirements: prioritize verified updates and nearest-safe-route alerts."
+            />
+            <input
+              value={profileTopicsInput}
+              onChange={(event) => setProfileTopicsInput(event.target.value)}
+              className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+              placeholder="Default crucial topics for your messages"
+            />
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void handleSaveProfile()}
+            className="mt-4 w-full rounded-[1.2rem] bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
+          >
+            Continue
+          </button>
+        </section>
+      </main>
+    );
+  }
+
   if (pinLocked) {
     return (
       <main className="flex min-h-screen items-center justify-center px-4 py-8">
@@ -1136,31 +1373,25 @@ export function NexusApp() {
 
           {section === "relay" && (
             <section className="mt-6 space-y-4">
-              {showReconnectBanner && reconnectOfferToken && (
+              {showReconnectBanner && reconnectRoomCode && (
                 <div className="rounded-[1.4rem] border border-amber-200 bg-amber-50 px-4 py-4 text-[#102033]">
                   <p className="text-sm font-semibold">Peer disconnected.</p>
                   <p className="mt-1 text-sm text-[#5a6472]">
-                    Show them the reconnect QR.
+                    Reconnecting - share code {reconnectRoomCode} with the other
+                    device.
                   </p>
                   <button
                     type="button"
                     onClick={() => {
                       setSection("connect");
-                      setConnectStep("sender_offer");
-                      setActiveQrTitle("Step 1 QR");
-                      setActiveQrDetail(
-                        "Keep this screen open. The other phone scans this, then shows you a second QR.",
-                      );
-                      setActiveQrStatus(
-                        formatRelativeTone("warning", "Reconnecting - scan again"),
-                      );
-                      void buildQrDataUrl(reconnectOfferToken).then(setConnectQrUrl);
+                      setConnectStep("initiator_show_code");
+                      setRoomCode(reconnectRoomCode);
                     }}
                     className={pressableCardClasses(
                       "mt-3 rounded-full bg-[#102033] px-4 py-2 text-sm font-semibold text-white",
                     )}
                   >
-                    Show QR
+                    Open Nearby
                   </button>
                 </div>
               )}
@@ -1333,6 +1564,11 @@ export function NexusApp() {
                     <p className="mt-3 text-lg leading-6 font-medium text-[#102033]">
                       {message.payload}
                     </p>
+                    {!!message.crucial_topics?.length && (
+                      <p className="mt-2 text-xs text-[#5a6472]">
+                        topics: {message.crucial_topics.join(", ")}
+                      </p>
+                    )}
                     <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-[#5a6472]">
                       <span>level {message.priority}</span>
                       <span>{message.temperature}</span>
@@ -1353,7 +1589,9 @@ export function NexusApp() {
                   <p className="text-xs uppercase tracking-[0.22em] text-white/60">
                     Saved
                   </p>
-                  <p className="mt-2 text-3xl font-semibold">{messages.length}</p>
+                  <p className="mt-2 text-3xl font-semibold">
+                    {messages.length}
+                  </p>
                 </article>
                 <article className="rounded-[1.4rem] bg-[#e35631] p-4 text-white">
                   <p className="text-xs uppercase tracking-[0.22em] text-white/60">
@@ -1408,7 +1646,9 @@ export function NexusApp() {
                           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">
                             Held
                           </p>
-                          <p className="mt-2">{devState.quarantineCount} saved</p>
+                          <p className="mt-2">
+                            {devState.quarantineCount} saved
+                          </p>
                         </div>
                       </div>
 
@@ -1561,6 +1801,36 @@ export function NexusApp() {
               />
 
               <label className="block text-sm text-[#5a6472]">
+                Crucial topics (comma separated)
+                <input
+                  value={draftTopicsInput}
+                  onChange={(event) => setDraftTopicsInput(event.target.value)}
+                  className="mt-2 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+                  placeholder="water, shelter, medicine"
+                />
+              </label>
+
+              {!!userProfile?.crucialTopics?.length && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#945f3d]">
+                    Quick topics
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {userProfile.crucialTopics.map((topic) => (
+                      <button
+                        key={topic}
+                        type="button"
+                        onClick={() => addDraftTopic(topic)}
+                        className="rounded-full border border-[#d7cfbe] bg-white px-3 py-1 text-xs font-semibold text-[#102033]"
+                      >
+                        {topic}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <label className="block text-sm text-[#5a6472]">
                 Priority
                 <select
                   value={draftPriority}
@@ -1608,27 +1878,33 @@ export function NexusApp() {
                 <>
                   <button
                     type="button"
-                    onClick={() => void handleCreateOffer()}
+                    onClick={() => void handleStartInitiator()}
                     className={pressableCardClasses(
                       "w-full rounded-[1.5rem] bg-[#102033] px-5 py-6 text-left text-white",
                     )}
                   >
                     <span className="block text-2xl font-semibold">Share</span>
                     <span className="mt-2 block text-sm text-white/70">
-                      Show a QR for the other phone to scan
+                      Generate a 4-digit room code
                     </span>
                   </button>
 
                   <button
                     type="button"
-                    onClick={() => setConnectStep("receiver_scan_offer")}
+                    onClick={() => {
+                      setConnectStep("joiner_enter_code");
+                      setJoinRoomCode("");
+                      setConnectStatusMessage("");
+                    }}
                     className={pressableCardClasses(
                       "w-full rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 px-5 py-6 text-left text-[#102033]",
                     )}
                   >
-                    <span className="block text-2xl font-semibold">Receive</span>
+                    <span className="block text-2xl font-semibold">
+                      Receive
+                    </span>
                     <span className="mt-2 block text-sm text-[#5a6472]">
-                      Scan a QR from the other phone
+                      Enter a 4-digit room code
                     </span>
                   </button>
 
@@ -1645,115 +1921,80 @@ export function NexusApp() {
                 </>
               )}
 
-              {connectStep === "sender_offer" && (
+              {connectStep === "initiator_show_code" && (
                 <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
-                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                    Step 1 of 2
-                  </p>
                   <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                    Show this to the other phone
+                    Share this room code
                   </h2>
-                  {activeQrStatus && (
-                    <span
-                      className={classNames(
-                        "mt-4 inline-flex rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em]",
-                        toneClasses(activeQrStatus.tone),
-                      )}
-                    >
-                      {activeQrStatus.label}
-                    </span>
-                  )}
-                  <div className="mt-4 rounded-[1.6rem] bg-white p-4 shadow-[0_18px_60px_rgba(16,32,51,0.14)]">
-                    {connectQrUrl ? (
-                      <Image
-                        src={connectQrUrl}
-                        alt="Connection QR"
-                        width={1200}
-                        height={1200}
-                        unoptimized
-                        className="h-auto w-full"
-                      />
-                    ) : (
-                      <div className="flex min-h-64 items-center justify-center text-sm text-[#5a6472]">
-                        Building QR...
-                      </div>
-                    )}
+                  <div className="mt-5 rounded-[1.6rem] bg-white p-8 text-center shadow-[0_18px_60px_rgba(16,32,51,0.14)]">
+                    <p className="text-5xl font-bold tracking-[0.5em] text-[#102033]">
+                      {roomCode || "----"}
+                    </p>
                   </div>
                   <p className="mt-4 text-sm text-[#5a6472]">
-                    Keep this screen open. The other phone scans this, then shows you a second QR.
+                    Share this code with the other device.
+                  </p>
+                  <p className="mt-2 text-sm font-semibold text-[#102033]">
+                    {connectStatusMessage || "Waiting for other device..."}
                   </p>
                   <button
                     type="button"
-                    onClick={() => setConnectStep("sender_scan_answer")}
+                    onClick={() => {
+                      intentionalCloseRef.current = true;
+                      clearAnswerPolling();
+                      syncChannelRef.current?.close();
+                      offerPeerRef.current?.channel.close();
+                      offerPeerRef.current?.connection.close();
+                      setRoomCode("");
+                      setConnectStatusMessage("");
+                      setConnectStep("pick_role");
+                    }}
+                    className={pressableCardClasses(
+                      "mt-4 w-full rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]",
+                    )}
+                  >
+                    Cancel
+                  </button>
+                </section>
+              )}
+
+              {connectStep === "joiner_enter_code" && (
+                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
+                  <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
+                    Enter room code
+                  </h2>
+                  <input
+                    value={joinRoomCode}
+                    onChange={(event) =>
+                      setJoinRoomCode(
+                        event.target.value.replace(/\D/g, "").slice(0, 4),
+                      )
+                    }
+                    className="mt-4 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-center text-3xl tracking-[0.4em] text-[#102033] outline-none"
+                    inputMode="numeric"
+                    maxLength={4}
+                    placeholder="0000"
+                  />
+                  {!!connectStatusMessage && (
+                    <p className="mt-3 text-sm text-[#5a6472]">
+                      {connectStatusMessage}
+                    </p>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void handleJoinerSubmit(joinRoomCode)}
                     className={pressableCardClasses(
                       "mt-4 w-full rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
                     )}
                   >
-                    Next — I&apos;ll scan their QR
+                    Connect
                   </button>
-                </section>
-              )}
-
-              {connectStep === "sender_scan_answer" && (
-                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
-                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                    Step 2 of 2
-                  </p>
-                  <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                    Scan their QR
-                  </h2>
-                  <div className="mt-4 overflow-hidden rounded-[2rem] border border-[#d7cfbe] bg-black">
-                    <video
-                      ref={videoRef}
-                      className="aspect-[3/4] h-full w-full object-cover"
-                      muted
-                      playsInline
-                    />
-                  </div>
-                  <p className="mt-4 text-sm text-[#5a6472]">
-                    The other phone is showing a QR. Point your camera at it.
-                  </p>
-                  <p className="mt-2 text-sm text-[#5a6472]">{scannerStatus}</p>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setConnectStep("sender_offer");
-                      setScannerMode(null);
-                    }}
-                    className={pressableCardClasses(
-                      "mt-4 rounded-full border border-[#d7cfbe] bg-white px-4 py-2 text-sm font-semibold text-[#102033]",
-                    )}
-                  >
-                    ← Back
-                  </button>
-                </section>
-              )}
-
-              {connectStep === "receiver_scan_offer" && (
-                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
-                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                    Step 1 of 2
-                  </p>
-                  <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                    Scan their QR
-                  </h2>
-                  <div className="mt-4 overflow-hidden rounded-[2rem] border border-[#d7cfbe] bg-black">
-                    <video
-                      ref={videoRef}
-                      className="aspect-[3/4] h-full w-full object-cover"
-                      muted
-                      playsInline
-                    />
-                  </div>
-                  <p className="mt-4 text-sm text-[#5a6472]">
-                    The other phone is showing a QR. Point your camera at it.
-                  </p>
-                  <p className="mt-2 text-sm text-[#5a6472]">{scannerStatus}</p>
                   <button
                     type="button"
                     onClick={() => {
                       setConnectStep("pick_role");
-                      setScannerMode(null);
+                      setJoinRoomCode("");
+                      setConnectStatusMessage("");
                     }}
                     className={pressableCardClasses(
                       "mt-4 rounded-full border border-[#d7cfbe] bg-white px-4 py-2 text-sm font-semibold text-[#102033]",
@@ -1761,52 +2002,14 @@ export function NexusApp() {
                   >
                     ← Back
                   </button>
-                </section>
-              )}
-
-              {connectStep === "receiver_show_answer" && (
-                <section className="rounded-[1.5rem] border border-[#d7cfbe] bg-white/85 p-4">
-                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[#945f3d]">
-                    Step 2 of 2
-                  </p>
-                  <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
-                    Show this to the other phone
-                  </h2>
-                  {activeQrStatus && (
-                    <span
-                      className={classNames(
-                        "mt-4 inline-flex rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em]",
-                        toneClasses(activeQrStatus.tone),
-                      )}
-                    >
-                      {activeQrStatus.label}
-                    </span>
-                  )}
-                  <div className="mt-4 rounded-[1.6rem] bg-white p-4 shadow-[0_18px_60px_rgba(16,32,51,0.14)]">
-                    {connectQrUrl ? (
-                      <Image
-                        src={connectQrUrl}
-                        alt="Connection answer QR"
-                        width={1200}
-                        height={1200}
-                        unoptimized
-                        className="h-auto w-full"
-                      />
-                    ) : (
-                      <div className="flex min-h-64 items-center justify-center text-sm text-[#5a6472]">
-                        Building QR...
-                      </div>
-                    )}
-                  </div>
-                  <p className="mt-4 text-sm text-[#5a6472]">
-                    The first phone scans this to complete the connection.
-                  </p>
                 </section>
               )}
 
               {connectStep === "connected" && (
                 <section className="rounded-[1.5rem] border border-emerald-200 bg-emerald-50 p-4">
-                  <p className="text-2xl font-semibold text-emerald-900">Connected</p>
+                  <p className="text-2xl font-semibold text-emerald-900">
+                    Connected
+                  </p>
                   <p className="mt-2 text-sm text-emerald-900">{syncText}</p>
                   <button
                     type="button"
@@ -1841,14 +2044,9 @@ export function NexusApp() {
                   <h2 className="mt-2 text-2xl font-semibold text-[#102033]">
                     Scan a snapshot QR
                   </h2>
-                  <div className="mt-4 overflow-hidden rounded-[2rem] border border-[#d7cfbe] bg-black">
-                    <video
-                      ref={videoRef}
-                      className="aspect-[3/4] h-full w-full object-cover"
-                      muted
-                      playsInline
-                    />
-                  </div>
+                  <p className="mt-3 text-sm text-[#5a6472]">
+                    The camera opens in a full-screen scanner overlay.
+                  </p>
                   <p className="mt-4 text-sm text-[#5a6472]">{scannerStatus}</p>
                   <button
                     type="button"
@@ -1875,7 +2073,6 @@ export function NexusApp() {
                 onClick={() => {
                   if (item === "connect") {
                     setConnectStep("pick_role");
-                    setConnectQrUrl("");
                   }
                   setSection(item);
                 }}
@@ -1897,7 +2094,9 @@ export function NexusApp() {
         <div className="fixed inset-0 z-40 flex items-end bg-[#102033]/40 p-4">
           <section className="w-full rounded-[2rem] bg-[#f8f4eb] p-5 shadow-2xl">
             <div className="flex items-center justify-between">
-              <h2 className="text-2xl font-semibold text-[#102033]">Settings</h2>
+              <h2 className="text-2xl font-semibold text-[#102033]">
+                Settings
+              </h2>
               <button
                 type="button"
                 onClick={() => setSettingsOpen(false)}
@@ -1909,11 +2108,35 @@ export function NexusApp() {
               </button>
             </div>
 
-            <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
-                <button
-                  type="button"
-                  onClick={() => setSecuritySection("security")}
-                  className={classNames(
+            <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-5">
+              <button
+                type="button"
+                onClick={() => setSecuritySection("network")}
+                className={classNames(
+                  "rounded-[1rem] px-3 py-3 text-sm font-semibold transition duration-150 active:scale-[0.98]",
+                  securitySection === "network"
+                    ? "bg-[#102033] text-white"
+                    : "bg-white text-[#102033]",
+                )}
+              >
+                Network
+              </button>
+              <button
+                type="button"
+                onClick={() => setSecuritySection("profile")}
+                className={classNames(
+                  "rounded-[1rem] px-3 py-3 text-sm font-semibold transition duration-150 active:scale-[0.98]",
+                  securitySection === "profile"
+                    ? "bg-[#102033] text-white"
+                    : "bg-white text-[#102033]",
+                )}
+              >
+                Profile
+              </button>
+              <button
+                type="button"
+                onClick={() => setSecuritySection("security")}
+                className={classNames(
                   "rounded-[1rem] px-3 py-3 text-sm font-semibold transition duration-150 active:scale-[0.98]",
                   securitySection === "security"
                     ? "bg-[#102033] text-white"
@@ -1922,10 +2145,10 @@ export function NexusApp() {
               >
                 Lock
               </button>
-                <button
-                  type="button"
-                  onClick={() => setSecuritySection("emergency")}
-                  className={classNames(
+              <button
+                type="button"
+                onClick={() => setSecuritySection("emergency")}
+                className={classNames(
                   "rounded-[1rem] px-3 py-3 text-sm font-semibold transition duration-150 active:scale-[0.98]",
                   securitySection === "emergency"
                     ? "bg-[#102033] text-white"
@@ -1934,10 +2157,10 @@ export function NexusApp() {
               >
                 Wipe
               </button>
-                <button
-                  type="button"
-                  onClick={() => setSecuritySection("developer")}
-                  className={classNames(
+              <button
+                type="button"
+                onClick={() => setSecuritySection("developer")}
+                className={classNames(
                   "rounded-[1rem] px-3 py-3 text-sm font-semibold transition duration-150 active:scale-[0.98]",
                   securitySection === "developer"
                     ? "bg-[#102033] text-white"
@@ -1947,6 +2170,58 @@ export function NexusApp() {
                 Debug
               </button>
             </div>
+
+            {securitySection === "network" && (
+              <div className="mt-4 space-y-3">
+                <input
+                  value={networkDraftHost}
+                  onChange={(event) => setNetworkDraftHost(event.target.value)}
+                  className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+                  placeholder="192.168.1.x:3000"
+                />
+                <button
+                  type="button"
+                  onClick={() => saveSignalingHost(networkDraftHost)}
+                  className="w-full rounded-[1.2rem] bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
+                >
+                  Change Server
+                </button>
+              </div>
+            )}
+
+            {securitySection === "profile" && (
+              <div className="mt-4 space-y-3">
+                <input
+                  value={profilePrefsInput}
+                  onChange={(event) => setProfilePrefsInput(event.target.value)}
+                  className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+                  placeholder="Preferences (comma separated): medicine, shelter"
+                />
+                <textarea
+                  value={profileRequirementsInput}
+                  onChange={(event) =>
+                    setProfileRequirementsInput(event.target.value)
+                  }
+                  className="h-24 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+                  placeholder="Requirements: Include confirmed evacuation updates first."
+                />
+                <input
+                  value={profileTopicsInput}
+                  onChange={(event) =>
+                    setProfileTopicsInput(event.target.value)
+                  }
+                  className="w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-[#102033] outline-none"
+                  placeholder="Crucial topics for your outgoing messages"
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleSaveProfile()}
+                  className="w-full rounded-[1.2rem] bg-[#102033] px-4 py-3 text-sm font-semibold text-white"
+                >
+                  Save Profile
+                </button>
+              </div>
+            )}
 
             {securitySection === "security" && (
               <div className="mt-4 space-y-3">
@@ -2037,10 +2312,7 @@ export function NexusApp() {
         </div>
       )}
 
-      {scannerMode &&
-        connectStep !== "sender_scan_answer" &&
-        connectStep !== "receiver_scan_offer" &&
-        connectStep !== "snapshot_scan" && (
+      {scannerMode && (
         <div className="fixed inset-0 z-50 bg-[#08111c] px-4 py-6 text-white">
           <div className="mx-auto flex h-full w-full max-w-2xl flex-col">
             <div className="flex items-center justify-between">
@@ -2050,8 +2322,6 @@ export function NexusApp() {
                 </p>
                 <h2 className="mt-2 text-2xl font-semibold">
                   {scannerMode === "snapshot" && "Scan Share QR"}
-                  {scannerMode === "offer" && "Scan First QR"}
-                  {scannerMode === "answer" && "Scan Second QR"}
                 </h2>
               </div>
               <button
@@ -2078,31 +2348,31 @@ export function NexusApp() {
         </div>
       )}
 
-      {activeQrUrl && activeQrTitle === "Share QR" && (
+      {snapshotQrUrl && snapshotQrTitle === "Share QR" && (
         <div className="fixed inset-0 z-50 bg-[#f6f2e8] px-4 py-6">
           <div className="mx-auto flex h-full w-full max-w-2xl flex-col items-center justify-center">
             <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#945f3d]">
               Nexus Relay
             </p>
             <h2 className="mt-3 text-center text-3xl font-semibold text-[#102033]">
-              {activeQrTitle}
+              {snapshotQrTitle}
             </h2>
 
-            {activeQrStatus && (
+            {snapshotQrStatus && (
               <span
                 className={classNames(
                   "mt-4 rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em]",
-                  toneClasses(activeQrStatus.tone),
+                  toneClasses(snapshotQrStatus.tone),
                 )}
               >
-                {activeQrStatus.label}
+                {snapshotQrStatus.label}
               </span>
             )}
 
             <div className="mt-6 w-full rounded-[2rem] bg-white p-4 shadow-[0_18px_60px_rgba(16,32,51,0.14)]">
               <Image
-                src={activeQrUrl}
-                alt={activeQrTitle}
+                src={snapshotQrUrl}
+                alt={snapshotQrTitle}
                 width={1200}
                 height={1200}
                 unoptimized
@@ -2110,11 +2380,11 @@ export function NexusApp() {
               />
             </div>
             <p className="mt-5 text-center text-sm text-[#5a6472]">
-              {activeQrDetail}
+              {snapshotQrDetail}
             </p>
             <button
               type="button"
-              onClick={closeQr}
+              onClick={hideSnapshotQr}
               className={pressableCardClasses(
                 "mt-6 rounded-[1.3rem] bg-[#102033] px-6 py-3 text-sm font-semibold text-white",
               )}
@@ -2155,6 +2425,12 @@ export function NexusApp() {
               {selectedMessage.payload}
             </p>
 
+            {!!selectedMessage.crucial_topics?.length && (
+              <p className="mt-2 text-sm text-[#5a6472]">
+                topics: {selectedMessage.crucial_topics.join(", ")}
+              </p>
+            )}
+
             <div className="mt-5 grid grid-cols-2 gap-3 text-sm text-[#425061]">
               <div className="rounded-[1.2rem] bg-white px-4 py-3">
                 <p>level {selectedMessage.priority}</p>
@@ -2168,7 +2444,8 @@ export function NexusApp() {
               </div>
             </div>
 
-            {(selectedMessage.is_conflicted || selectedMessage.is_superseded) && (
+            {(selectedMessage.is_conflicted ||
+              selectedMessage.is_superseded) && (
               <div className="mt-4 rounded-[1.2rem] bg-amber-100 px-4 py-3 text-sm text-amber-900">
                 {selectedMessage.is_conflicted &&
                   `This message has other versions: ${selectedMessage.conflict_ids.join(", ")}.`}
@@ -2186,31 +2463,41 @@ export function NexusApp() {
                   if (!message || !repositoryRef.current) return;
                   setSelectedShareIds([message.id]);
                   setSharePanelOpen(true);
-                  void runSnapshotSharePipeline(repositoryRef.current, [
-                    toRawMessage(message),
-                  ]).then(async (result) => {
-                    recordPipelineRun(result.run);
-                    const snapshot = result.snapshot;
-                    if (!snapshot) {
-                      noteStatus("danger", "Snapshot build failed", result.run.summary);
-                      return;
-                    }
-                    setDevState((current) => ({
-                      ...current,
-                      lastSnapshotPayload: snapshot.qr,
-                    }));
-                    await openQr(
-                      "Share QR",
-                      "Share this message with another phone.",
-                      snapshot.qr,
-                      formatRelativeTone("ready", "1 message packed"),
-                    );
-                  }).catch((error: unknown) => {
-                    noteStatus(
-                      "danger",
-                      error instanceof Error ? error.message : "Snapshot build failed",
-                    );
-                  });
+                  void runSnapshotSharePipeline(
+                    repositoryRef.current,
+                    [toRawMessage(message)],
+                    userProfile ?? undefined,
+                  )
+                    .then(async (result) => {
+                      recordPipelineRun(result.run);
+                      const snapshot = result.snapshot;
+                      if (!snapshot) {
+                        noteStatus(
+                          "danger",
+                          "Snapshot build failed",
+                          result.run.summary,
+                        );
+                        return;
+                      }
+                      setDevState((current) => ({
+                        ...current,
+                        lastSnapshotPayload: snapshot.qr,
+                      }));
+                      await showSnapshotQr(
+                        "Share QR",
+                        "Share this message with another phone.",
+                        snapshot.qr,
+                        formatRelativeTone("ready", "1 message packed"),
+                      );
+                    })
+                    .catch((error: unknown) => {
+                      noteStatus(
+                        "danger",
+                        error instanceof Error
+                          ? error.message
+                          : "Snapshot build failed",
+                      );
+                    });
                 }}
                 className="rounded-[1.3rem] border border-[#d7cfbe] bg-white px-4 py-4 text-sm font-semibold text-[#102033]"
               >

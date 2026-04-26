@@ -39,6 +39,7 @@ export function applyPrivacy(raw: NexusMessage): NexusMessage {
     hop_count: raw.hop_count,
     weight: raw.weight,
     payload: raw.payload,
+    crucial_topics: raw.crucial_topics,
     confidence: raw.confidence,
     supersedes: raw.supersedes,
     superseded_by: raw.superseded_by,
@@ -92,8 +93,9 @@ export async function ingestMessage(
   if (raw.schema_version !== 1) {
     if (repository) {
       const existing =
-        (await repository.getSystemState<Partial<NexusMessage>[]>(QUARANTINE_KEY)) ??
-        [];
+        (await repository.getSystemState<Partial<NexusMessage>[]>(
+          QUARANTINE_KEY,
+        )) ?? [];
       await repository.setSystemState(QUARANTINE_KEY, [...existing, raw]);
     }
     return { status: "quarantined", reason: "Unsupported schema_version." };
@@ -121,7 +123,6 @@ export async function ingestMessage(
   const incoming = normalizeIngressMessage(validated);
 
   if (repository) {
-
     if (incoming.supersedes) {
       const oldMessage = await repository.getById(incoming.supersedes);
       if (oldMessage) {
@@ -151,6 +152,7 @@ export function runScoringLoop(
       hop_count: message.hop_count,
       weight: message.weight,
       payload: message.payload,
+      crucial_topics: message.crucial_topics,
       confidence: message.confidence,
       supersedes: message.supersedes,
       superseded_by: message.superseded_by,

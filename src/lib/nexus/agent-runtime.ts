@@ -7,6 +7,7 @@ import {
 } from "./phase2";
 import { createSessionId } from "./phase3";
 import { BloomFilter } from "./phase4";
+import { prioritizeMessagesForProfile, type NexusUserProfile } from "./profile";
 import { buildSnapshot, decodeTransportPayload } from "./qr";
 import {
   linkConflictVariant,
@@ -25,11 +26,7 @@ export type PipelineMode =
   | "peer_receive"
   | "qr_share";
 
-export type PipelineStageStatus =
-  | "success"
-  | "skipped"
-  | "warning"
-  | "error";
+export type PipelineStageStatus = "success" | "skipped" | "warning" | "error";
 
 export interface PipelineEvent {
   timestamp: number;
@@ -72,6 +69,8 @@ export interface PipelineContext {
   qrPayload?: string;
   peerBloom?: BloomFilter;
   peerBloomBase64?: string;
+  localProfile?: NexusUserProfile;
+  peerProfile?: NexusUserProfile;
   validatedMessage?: NexusMessage;
   candidateMessage?: NexusMessage;
   persistedMessage?: NexusMessageWithComputed;
@@ -131,10 +130,13 @@ function terminalStage(
   };
 }
 
-async function getQuarantineCount(repository: NexusRepository): Promise<number> {
+async function getQuarantineCount(
+  repository: NexusRepository,
+): Promise<number> {
   const quarantine =
-    (await repository.getSystemState<Partial<NexusMessage>[]>(QUARANTINE_KEY)) ??
-    [];
+    (await repository.getSystemState<Partial<NexusMessage>[]>(
+      QUARANTINE_KEY,
+    )) ?? [];
   return quarantine.length;
 }
 
@@ -179,7 +181,11 @@ export const IngestionStage: NexusStage = {
             summary: `Duplicate detected for ${message.id}.`,
           },
           events: [
-            makeEvent(this.name, "warning", `Duplicate local message ${message.id}.`),
+            makeEvent(
+              this.name,
+              "warning",
+              `Duplicate local message ${message.id}.`,
+            ),
           ],
         };
       }
@@ -191,7 +197,9 @@ export const IngestionStage: NexusStage = {
           status: "success",
           summary: `Created draft ${message.id}.`,
         },
-        events: [makeEvent(this.name, "success", `Created draft ${message.id}.`)],
+        events: [
+          makeEvent(this.name, "success", `Created draft ${message.id}.`),
+        ],
       };
     }
 
@@ -214,7 +222,11 @@ export const IngestionStage: NexusStage = {
               summary: "Unsupported QR payload kind.",
             },
             events: [
-              makeEvent(this.name, "error", "QR payload was not a snapshot bundle."),
+              makeEvent(
+                this.name,
+                "error",
+                "QR payload was not a snapshot bundle.",
+              ),
             ],
           };
         }
@@ -279,7 +291,10 @@ export const IngestionStage: NexusStage = {
           (await context.repository.getSystemState<Partial<NexusMessage>[]>(
             QUARANTINE_KEY,
           )) ?? [];
-        await context.repository.setSystemState(QUARANTINE_KEY, [...existing, raw]);
+        await context.repository.setSystemState(QUARANTINE_KEY, [
+          ...existing,
+          raw,
+        ]);
         const next: PipelineContext = {
           ...context,
           quarantineCount: existing.length + 1,
@@ -296,7 +311,11 @@ export const IngestionStage: NexusStage = {
             summary: "Unsupported schema quarantined.",
           },
           events: [
-            makeEvent(this.name, "warning", "Unsupported schema_version quarantined."),
+            makeEvent(
+              this.name,
+              "warning",
+              "Unsupported schema_version quarantined.",
+            ),
           ],
         };
       }
@@ -334,7 +353,9 @@ export const IngestionStage: NexusStage = {
             status: "warning",
             summary: `Duplicate ${validated.id} skipped.`,
           },
-          events: [makeEvent(this.name, "warning", `Duplicate ${validated.id}.`)],
+          events: [
+            makeEvent(this.name, "warning", `Duplicate ${validated.id}.`),
+          ],
         };
       }
 
@@ -420,7 +441,11 @@ export const PrivacyStage: NexusStage = {
 export const RelayEngineStage: NexusStage = {
   name: "Relay Engine",
   async run(context) {
-    if (context.terminal && context.mode !== "peer_send" && context.mode !== "qr_share") {
+    if (
+      context.terminal &&
+      context.mode !== "peer_send" &&
+      context.mode !== "qr_share"
+    ) {
       return terminalStage(this.name, context);
     }
 
@@ -438,13 +463,15 @@ export const RelayEngineStage: NexusStage = {
           : await selectRelayMessages(
               context.repository,
               context.mode === "peer_send" ? context.peerBloom : undefined,
+              context.mode === "peer_send" ? context.peerProfile : undefined,
             );
       const { selectedMessages } = relaySelection;
 
       return {
         context: {
           ...context,
-          rankedMessages: rankedMessages ?? (await rankStoredMessages(context.repository)),
+          rankedMessages:
+            rankedMessages ?? (await rankStoredMessages(context.repository)),
           selectedMessages,
         },
         stage: {
@@ -557,7 +584,9 @@ export const StorageStage: NexusStage = {
     }
 
     await context.repository.put(context.candidateMessage);
-    const stored = await context.repository.getById(context.candidateMessage.id);
+    const stored = await context.repository.getById(
+      context.candidateMessage.id,
+    );
 
     return {
       context: {
@@ -573,7 +602,13 @@ export const StorageStage: NexusStage = {
         status: "success",
         summary: `Stored ${context.candidateMessage.id}.`,
       },
-      events: [makeEvent(this.name, "success", `Stored ${context.candidateMessage.id}.`)],
+      events: [
+        makeEvent(
+          this.name,
+          "success",
+          `Stored ${context.candidateMessage.id}.`,
+        ),
+      ],
     };
   },
 };
@@ -586,8 +621,13 @@ export const QRShareStage: NexusStage = {
     }
 
     if (context.mode === "qr_share") {
-      const source = context.selectedMessages ?? (await context.repository.getAllRaw());
-      const snapshot = buildSnapshot(source);
+      const source =
+        context.selectedMessages ?? (await context.repository.getAllRaw());
+      const prioritized = prioritizeMessagesForProfile(
+        source,
+        context.localProfile,
+      );
+      const snapshot = buildSnapshot(prioritized);
       return {
         context: { ...context, snapshot },
         stage: {
@@ -709,11 +749,13 @@ export async function runComposePipeline(
 export async function runSnapshotSharePipeline(
   repository: NexusRepository,
   sourceMessages?: NexusMessage[],
+  localProfile?: NexusUserProfile,
 ): Promise<{ run: PipelineRun; snapshot?: { qr: string; count: number } }> {
   const { run, context } = await runPipeline({
     mode: "qr_share",
     repository,
     sourceMessages,
+    localProfile,
   });
 
   return { run, snapshot: context.snapshot };
@@ -722,6 +764,7 @@ export async function runSnapshotSharePipeline(
 export async function runPeerSendSelectionPipeline(
   repository: NexusRepository,
   peerBloomBase64: string,
+  peerProfile?: NexusUserProfile,
 ): Promise<{ run: PipelineRun; messages: NexusMessage[] }> {
   const peerBloom = BloomFilter.fromBase64(peerBloomBase64);
   const { run, context } = await runPipeline({
@@ -729,6 +772,7 @@ export async function runPeerSendSelectionPipeline(
     repository,
     peerBloom,
     peerBloomBase64,
+    peerProfile,
   });
 
   return { run, messages: context.selectedMessages ?? [] };
@@ -803,7 +847,8 @@ export async function runSnapshotIngressPipeline(
     }
     results.push({
       status: received.result,
-      messageId: received.message?.id ?? ("id" in message ? message.id : undefined),
+      messageId:
+        received.message?.id ?? ("id" in message ? message.id : undefined),
       reason: received.run.summary,
     });
   }
@@ -813,7 +858,11 @@ export async function runSnapshotIngressPipeline(
       id: decode.run.id,
       mode: "qr_ingest",
       status:
-        stored > 0 ? "completed" : decode.run.status === "failed" ? "failed" : "partial",
+        stored > 0
+          ? "completed"
+          : decode.run.status === "failed"
+            ? "failed"
+            : "partial",
       summary: `Snapshot ingest processed ${results.length} messages and stored ${stored}.`,
       startedAt: decode.run.startedAt,
       completedAt: Date.now(),
