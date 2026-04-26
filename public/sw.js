@@ -1,60 +1,76 @@
-const CACHE_NAME = "nexus-shell-v5";
-const APP_SHELL = [
-  "/",
-  "/offline.html",
-  "/manifest.json",
-  "/favicon.ico",
-  "/icon.svg",
-];
+const CACHE_NAME = "nexus-v1";
+const SHELL_URLS = ["/", "/manifest.json"];
 
 self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL_URLS)),
+  );
   self.skipWaiting();
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)));
 });
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    Promise.all([
-      caches.keys().then((keys) =>
-        Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))),
-      ),
-      self.clients.claim(),
-    ]),
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key !== CACHE_NAME)
+            .map((key) => caches.delete(key)),
+        ),
+      )
+      .then(() => self.clients.claim()),
   );
 });
 
 self.addEventListener("fetch", (event) => {
-  if (event.request.method !== "GET") return;
+  const { request } = event;
+  const url = new URL(request.url);
 
-  if (event.request.mode === "navigate") {
+  if (request.method !== "GET" || url.origin !== self.location.origin) {
+    return;
+  }
+
+  if (url.pathname.startsWith("/_next/static/")) {
     event.respondWith(
-      fetch(event.request)
+      caches.open(CACHE_NAME).then(async (cache) => {
+        const cached = await cache.match(request);
+        if (cached) return cached;
+        const response = await fetch(request);
+        if (response.ok) cache.put(request, response.clone());
+        return response;
+      }),
+    );
+    return;
+  }
+
+  if (request.mode === "navigate") {
+    event.respondWith(
+      fetch(request)
         .then((response) => {
-          const copy = response.clone();
-          void caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
           return response;
         })
         .catch(async () => {
-          const cached = await caches.match(event.request);
-          return cached ?? caches.match("/offline.html");
+          const cached = await caches.match(request);
+          return cached ?? (await caches.match("/")) ?? Response.error();
         }),
     );
     return;
   }
 
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-
-      return fetch(event.request).then((response) => {
-        if (!response || response.status !== 200 || response.type !== "basic") {
-          return response;
+    fetch(request)
+      .then((response) => {
+        if (response.ok) {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
         }
-
-        const copy = response.clone();
-        void caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
-      });
-    }),
+      })
+      .catch(() =>
+        caches.match(request).then((cached) => cached ?? Response.error()),
+      ),
   );
 });

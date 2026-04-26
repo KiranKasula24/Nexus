@@ -65,6 +65,7 @@ export type NexusComponentName =
 export interface PipelineContext {
   mode: PipelineMode;
   repository: NexusRepository;
+  sourceMessages?: NexusMessage[];
   draftInput?: CreateMessageInput;
   incomingMessage?: Partial<NexusMessage>;
   incomingMessages?: Partial<NexusMessage>[];
@@ -424,15 +425,26 @@ export const RelayEngineStage: NexusStage = {
     }
 
     if (context.mode === "peer_send" || context.mode === "qr_share") {
-      const { rankedMessages, selectedMessages } = await selectRelayMessages(
-        context.repository,
-        context.mode === "peer_send" ? context.peerBloom : undefined,
-      );
+      const rankedMessages =
+        context.mode === "qr_share" && context.sourceMessages
+          ? [...context.sourceMessages].map((message) => ({
+              ...message,
+              ...computeFields(message),
+            }))
+          : undefined;
+      const relaySelection =
+        context.mode === "qr_share" && context.sourceMessages
+          ? { selectedMessages: context.sourceMessages }
+          : await selectRelayMessages(
+              context.repository,
+              context.mode === "peer_send" ? context.peerBloom : undefined,
+            );
+      const { selectedMessages } = relaySelection;
 
       return {
         context: {
           ...context,
-          rankedMessages,
+          rankedMessages: rankedMessages ?? (await rankStoredMessages(context.repository)),
           selectedMessages,
         },
         stage: {
@@ -696,10 +708,12 @@ export async function runComposePipeline(
 
 export async function runSnapshotSharePipeline(
   repository: NexusRepository,
+  sourceMessages?: NexusMessage[],
 ): Promise<{ run: PipelineRun; snapshot?: { qr: string; count: number } }> {
   const { run, context } = await runPipeline({
     mode: "qr_share",
     repository,
+    sourceMessages,
   });
 
   return { run, snapshot: context.snapshot };
