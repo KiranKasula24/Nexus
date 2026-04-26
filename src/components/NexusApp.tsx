@@ -27,6 +27,7 @@ import {
   runSnapshotSharePipeline,
   savePinHash,
   SCORING_INTERVAL_MS,
+  setRelayBlockedState,
   startCameraScanner,
   submitPinAttempt,
   USER_PROFILE_KEY,
@@ -130,6 +131,48 @@ function formatRelativeTone(
   label: string,
 ): { tone: StatusTone; label: string } {
   return { tone, label };
+}
+
+function formatConsoleTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString("en-US", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function describePipelineEvent(run: PipelineRun, event: PipelineRun["events"][number]): string {
+  const counters = [
+    typeof event.inputCount === "number" ? `in=${event.inputCount}` : null,
+    typeof event.outputCount === "number" ? `out=${event.outputCount}` : null,
+    typeof event.droppedForFloor === "number"
+      ? `floor_drop=${event.droppedForFloor}`
+      : null,
+    typeof event.droppedForPreference === "number"
+      ? `pref_drop=${event.droppedForPreference}`
+      : null,
+  ].filter(Boolean);
+
+  const annotations = [
+    event.matchedTopics?.length
+      ? `topics=${event.matchedTopics.join(",")}`
+      : null,
+    event.inferredTopics?.length
+      ? `inferred=${event.inferredTopics.join(",")}`
+      : null,
+    event.sentinelBlocked ? "sentinel=blocked" : null,
+    event.messageId ? `msg=${event.messageId}` : null,
+  ].filter(Boolean);
+
+  return [
+    `${formatConsoleTime(event.timestamp)} [${run.mode}] ${event.component} ${event.status.toUpperCase()}`,
+    event.detail,
+    counters.length ? `(${counters.join(" ")})` : null,
+    annotations.length ? `[${annotations.join(" | ")}]` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 async function buildQrDataUrl(value: string): Promise<string> {
@@ -413,6 +456,11 @@ export function NexusApp() {
     }
   }
 
+  async function applyRelayBlockedState(blocked: boolean): Promise<void> {
+    if (!repositoryRef.current) return;
+    await setRelayBlockedState(repositoryRef.current, blocked);
+  }
+
   function closePeerArtifacts(peer: PeerArtifacts | null): void {
     peer?.channel.close();
     peer?.connection.close();
@@ -541,6 +589,9 @@ export function NexusApp() {
       if (storedPinHash) {
         setPinHash(storedPinHash);
         setPinLocked(true);
+        await setRelayBlockedState(repository, true);
+      } else {
+        await setRelayBlockedState(repository, false);
       }
 
       if (await repository.isUsingMemoryStorage()) {
@@ -746,7 +797,7 @@ export function NexusApp() {
       recordPipelineRun(result.run);
       const snapshot = result.snapshot;
       if (!snapshot) {
-        noteStatus("danger", "Snapshot build failed", result.run.summary);
+        noteStatus("warning", "Snapshot not generated", result.run.summary);
         return;
       }
       setDevState((current) => ({
@@ -1156,6 +1207,7 @@ export function NexusApp() {
     try {
       const hash = await savePinHash(repositoryRef.current, pinSetup);
       setPinHash(hash);
+      await applyRelayBlockedState(false);
       setSentinelStatus("PIN saved");
       noteStatus("ready", "PIN updated");
     } catch (error) {
@@ -1176,6 +1228,7 @@ export function NexusApp() {
 
     if (result.ok) {
       setPinLocked(false);
+      await applyRelayBlockedState(false);
       setSentinelStatus("Unlocked");
       noteStatus("ready", "Device unlocked");
       return;
@@ -1183,6 +1236,7 @@ export function NexusApp() {
 
     if (result.wiped) {
       setPinLocked(false);
+      await applyRelayBlockedState(false);
       setSentinelStatus(`Selective wipe deleted ${result.deleted} message(s)`);
       await refreshMessages();
       noteStatus(
@@ -1741,11 +1795,42 @@ export function NexusApp() {
                                   )}
                                 >
                                   {stage.component}
+                                  {typeof stage.outputCount === "number" &&
+                                    `:${stage.outputCount}`}
                                 </span>
                               ))}
                             </div>
                           </div>
                         ))}
+
+                        <div className="rounded-[1.2rem] border border-black bg-[#111111] px-3 py-3 font-mono text-xs text-[#d8f7dd]">
+                          <div className="flex items-center justify-between gap-3 border-b border-white/10 pb-2">
+                            <span className="uppercase tracking-[0.18em] text-[#7ef0a2]">
+                              Pipeline Console
+                            </span>
+                            <span className="text-[10px] uppercase tracking-[0.18em] text-white/45">
+                              oldest - newest
+                            </span>
+                          </div>
+                          <div className="mt-3 max-h-72 space-y-1 overflow-y-auto pr-1">
+                            {[...devState.runs]
+                              .reverse()
+                              .flatMap((run) => [
+                                `--- ${run.mode} ${run.status.toUpperCase()} ${run.summary}`,
+                                ...run.events.map((event) =>
+                                  describePipelineEvent(run, event),
+                                ),
+                              ])
+                              .map((line, index) => (
+                                <p
+                                  key={`${index}-${line.slice(0, 24)}`}
+                                  className="break-words leading-5"
+                                >
+                                  {line}
+                                </p>
+                              ))}
+                          </div>
+                        </div>
 
                         {devState.logs.map((entry) => (
                           <div
@@ -2295,7 +2380,11 @@ export function NexusApp() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setPinLocked(Boolean(pinHash))}
+                  onClick={() => {
+                    const shouldLock = Boolean(pinHash);
+                    setPinLocked(shouldLock);
+                    void applyRelayBlockedState(shouldLock);
+                  }}
                   className="w-full rounded-[1.2rem] bg-white px-4 py-3 text-sm font-semibold text-[#102033]"
                 >
                   Lock App Now
@@ -2536,8 +2625,8 @@ export function NexusApp() {
                       const snapshot = result.snapshot;
                       if (!snapshot) {
                         noteStatus(
-                          "danger",
-                          "Snapshot build failed",
+                          "warning",
+                          "Snapshot not generated",
                           result.run.summary,
                         );
                         return;

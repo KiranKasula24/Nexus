@@ -1,3 +1,4 @@
+import { classifyMessage } from "./classifier";
 import { createMessage, type CreateMessageInput } from "./phase1";
 import {
   applyPrivacy,
@@ -7,15 +8,17 @@ import {
 } from "./phase2";
 import { createSessionId } from "./phase3";
 import { BloomFilter } from "./phase4";
-import { prioritizeMessagesForProfile, type NexusUserProfile } from "./profile";
+import { type NexusUserProfile } from "./profile";
 import { buildSnapshot, decodeTransportPayload } from "./qr";
 import {
-  linkConflictVariant,
+  applyRelayGate,
+  computeBloomCandidates,
+  rankRelayCandidates,
   rankStoredMessages,
-  selectRelayMessages,
 } from "./relay-engine";
 import type { NexusRepository } from "./repository";
 import { computeFields } from "./scoring";
+import { shouldRelayBlocked } from "./sentinel";
 import { nowUnixSeconds } from "./time";
 import type { NexusMessage, NexusMessageWithComputed } from "./types";
 
@@ -30,15 +33,35 @@ export type PipelineStageStatus = "success" | "skipped" | "warning" | "error";
 
 export interface PipelineEvent {
   timestamp: number;
+  runId?: string;
+  mode?: PipelineMode;
   component: NexusComponentName;
   status: PipelineStageStatus;
   detail: string;
+  inputCount?: number;
+  outputCount?: number;
+  matchedTopics?: string[];
+  droppedForFloor?: number;
+  droppedForPreference?: number;
+  sentinelBlocked?: boolean;
+  messageId?: string;
+  inferredTopics?: string[];
+  matchedKeywords?: string[];
 }
 
 export interface PipelineStageResult {
   component: NexusComponentName;
   status: PipelineStageStatus;
   summary: string;
+  inputCount?: number;
+  outputCount?: number;
+  matchedTopics?: string[];
+  droppedForFloor?: number;
+  droppedForPreference?: number;
+  sentinelBlocked?: boolean;
+  messageId?: string;
+  inferredTopics?: string[];
+  matchedKeywords?: string[];
 }
 
 export interface PipelineRun {
@@ -55,7 +78,10 @@ export interface PipelineRun {
 export type NexusComponentName =
   | "Ingestion"
   | "Privacy"
-  | "Relay Engine"
+  | "Classifier"
+  | "Bloom Filter"
+  | "Prioritization Agent"
+  | "Relay Gate"
   | "Storage"
   | "QR Share";
 
@@ -75,7 +101,17 @@ export interface PipelineContext {
   candidateMessage?: NexusMessage;
   persistedMessage?: NexusMessageWithComputed;
   rankedMessages?: NexusMessageWithComputed[];
+  relayCandidates?: NexusMessage[];
+  rankedRelayMessages?: NexusMessageWithComputed[];
   selectedMessages?: NexusMessage[];
+  classifierTopics?: string[];
+  classifierInferredTopics?: string[];
+  classifierMatchedKeywords?: string[];
+  relayGateMatchedTopics?: string[];
+  relayGateDroppedForFloor?: number;
+  relayGateDroppedForPreference?: number;
+  relayBlocked?: boolean;
+  relayBlockedReason?: string;
   snapshot?: { qr: string; count: number };
   quarantineCount?: number;
   duplicate?: NexusMessageWithComputed;
@@ -105,12 +141,14 @@ function makeEvent(
   component: NexusComponentName,
   status: PipelineStageStatus,
   detail: string,
+  extras: Partial<PipelineEvent> = {},
 ): PipelineEvent {
   return {
     timestamp: Date.now(),
     component,
     status,
     detail,
+    ...extras,
   };
 }
 
@@ -438,102 +476,295 @@ export const PrivacyStage: NexusStage = {
   },
 };
 
-export const RelayEngineStage: NexusStage = {
-  name: "Relay Engine",
+export const ClassifierStage: NexusStage = {
+  name: "Classifier",
   async run(context) {
-    if (
-      context.terminal &&
-      context.mode !== "peer_send" &&
-      context.mode !== "qr_share"
-    ) {
+    if (context.terminal) {
       return terminalStage(this.name, context);
     }
 
-    if (context.mode === "peer_send" || context.mode === "qr_share") {
-      const rankedMessages =
-        context.mode === "qr_share" && context.sourceMessages
-          ? [...context.sourceMessages].map((message) => ({
-              ...message,
-              ...computeFields(message),
-            }))
-          : undefined;
-      const relaySelection =
-        context.mode === "qr_share" && context.sourceMessages
-          ? { selectedMessages: context.sourceMessages }
-          : await selectRelayMessages(
-              context.repository,
-              context.mode === "peer_send" ? context.peerBloom : undefined,
-              context.mode === "peer_send" ? context.peerProfile : undefined,
-            );
-      const { selectedMessages } = relaySelection;
-
-      return {
-        context: {
-          ...context,
-          rankedMessages:
-            rankedMessages ?? (await rankStoredMessages(context.repository)),
-          selectedMessages,
-        },
-        stage: {
-          component: this.name,
-          status: "success",
-          summary:
-            context.mode === "peer_send"
-              ? `Selected ${selectedMessages.length} novel messages for this encounter.`
-              : `Ranked ${selectedMessages.length} messages for snapshot sharing.`,
-        },
-        events: [
-          makeEvent(
-            this.name,
-            "success",
-            context.mode === "peer_send"
-              ? `Bloom comparison found ${selectedMessages.length} novel relay candidates.`
-              : `Ranked ${selectedMessages.length} messages for snapshot QR selection.`,
-          ),
-        ],
-      };
-    }
-
     if (!context.candidateMessage) {
-      const rankedMessages = await rankStoredMessages(context.repository);
       return {
-        context: { ...context, rankedMessages },
+        context,
         stage: {
           component: this.name,
-          status: "success",
-          summary: `Ranked ${rankedMessages.length} stored messages.`,
+          status: "skipped",
+          summary: "No candidate message to classify.",
         },
-        events: [
-          makeEvent(
-            this.name,
-            "success",
-            `Computed relay scores for ${rankedMessages.length} stored messages.`,
-          ),
-        ],
       };
     }
 
-    const mergeTarget = await linkConflictVariant(
-      context.repository,
-      context.candidateMessage,
-    );
+    const classified = classifyMessage(context.candidateMessage);
+    const candidateMessage: NexusMessage = {
+      ...context.candidateMessage,
+      crucial_topics: classified.topics,
+    };
 
     return {
-      context: { ...context, mergeTarget },
+      context: {
+        ...context,
+        candidateMessage,
+        classifierTopics: classified.topics,
+        classifierInferredTopics: classified.inferredTopics,
+        classifierMatchedKeywords: classified.matchedKeywords,
+      },
       stage: {
         component: this.name,
         status: "success",
-        summary: mergeTarget
-          ? `Stored conflict metadata for ${context.candidateMessage.id}.`
-          : `Prepared relay metadata for ${context.candidateMessage.id}.`,
+        summary:
+          classified.inferredTopics.length > 0
+            ? `Tagged ${candidateMessage.id} as ${classified.topics.join(", ")}.`
+            : `Normalized topics for ${candidateMessage.id}.`,
+        messageId: candidateMessage.id,
+        outputCount: classified.topics.length,
+        inferredTopics: classified.inferredTopics,
+        matchedKeywords: classified.matchedKeywords,
       },
       events: [
         makeEvent(
           this.name,
-          mergeTarget ? "warning" : "success",
-          mergeTarget
-            ? `Linked ${context.candidateMessage.id} to related local record ${mergeTarget.id}.`
-            : `Prepared ${context.candidateMessage.id} for relay scoring and storage.`,
+          "success",
+          classified.inferredTopics.length > 0
+            ? `Tagged ${candidateMessage.id} with ${classified.topics.join(", ")}.`
+            : `No new classifier tags for ${candidateMessage.id}; normalized existing topics.`,
+          {
+            messageId: candidateMessage.id,
+            outputCount: classified.topics.length,
+            inferredTopics: classified.inferredTopics,
+            matchedKeywords: classified.matchedKeywords,
+          },
+        ),
+      ],
+    };
+  },
+};
+
+export const BloomFilterStage: NexusStage = {
+  name: "Bloom Filter",
+  async run(context) {
+    if (context.terminal) {
+      return terminalStage(this.name, context);
+    }
+
+    if (context.mode !== "peer_send") {
+      return {
+        context,
+        stage: {
+          component: this.name,
+          status: "skipped",
+          summary: `Bloom filter not used for ${context.mode}.`,
+        },
+      };
+    }
+
+    const rawMessages = await context.repository.getAllRaw();
+    const candidates = context.peerBloom
+      ? computeBloomCandidates(rawMessages, context.peerBloom)
+      : rawMessages;
+
+    return {
+      context: { ...context, relayCandidates: candidates },
+      stage: {
+        component: this.name,
+        status: "success",
+        summary: `Diffed ${rawMessages.length} local IDs to ${candidates.length} novel relay candidates.`,
+        inputCount: rawMessages.length,
+        outputCount: candidates.length,
+      },
+      events: [
+        makeEvent(
+          this.name,
+          "success",
+          `Diffed ${rawMessages.length} local IDs against peer bloom; ${candidates.length} candidates remain.`,
+          {
+            inputCount: rawMessages.length,
+            outputCount: candidates.length,
+          },
+        ),
+      ],
+    };
+  },
+};
+
+export const PrioritizationAgentStage: NexusStage = {
+  name: "Prioritization Agent",
+  async run(context) {
+    if (context.terminal) {
+      return terminalStage(this.name, context);
+    }
+
+    if (context.mode === "peer_send") {
+      const relayCandidates = context.relayCandidates ?? [];
+      const rankedRelayMessages = rankRelayCandidates(relayCandidates);
+      return {
+        context: {
+          ...context,
+          rankedRelayMessages,
+        },
+        stage: {
+          component: this.name,
+          status: "success",
+          summary: `Ranked ${rankedRelayMessages.length} relay candidates for this encounter.`,
+          inputCount: relayCandidates.length,
+          outputCount: rankedRelayMessages.length,
+        },
+        events: [
+          makeEvent(
+            this.name,
+            "success",
+            `Ranked ${rankedRelayMessages.length} relay candidates by score.`,
+            {
+              inputCount: relayCandidates.length,
+              outputCount: rankedRelayMessages.length,
+            },
+          ),
+        ],
+      };
+    }
+
+    if (context.mode === "qr_share") {
+      const sourceMessages = context.sourceMessages ?? (await context.repository.getAllRaw());
+      const rankedRelayMessages = rankRelayCandidates(sourceMessages);
+      return {
+        context: {
+          ...context,
+          relayCandidates: sourceMessages,
+          rankedRelayMessages,
+        },
+        stage: {
+          component: this.name,
+          status: "success",
+          summary: `Ranked ${rankedRelayMessages.length} messages for snapshot relay.`,
+          inputCount: sourceMessages.length,
+          outputCount: rankedRelayMessages.length,
+        },
+        events: [
+          makeEvent(
+            this.name,
+            "success",
+            `Ranked ${rankedRelayMessages.length} snapshot candidates by score.`,
+            {
+              inputCount: sourceMessages.length,
+              outputCount: rankedRelayMessages.length,
+            },
+          ),
+        ],
+      };
+    }
+
+    const rankedMessages = await rankStoredMessages(context.repository);
+    return {
+      context: { ...context, rankedMessages },
+      stage: {
+        component: this.name,
+        status: "success",
+        summary: `Ranked ${rankedMessages.length} stored messages.`,
+        outputCount: rankedMessages.length,
+      },
+      events: [
+        makeEvent(
+          this.name,
+          "success",
+          `Ranked ${rankedMessages.length} stored messages for relay readiness.`,
+          {
+            outputCount: rankedMessages.length,
+          },
+        ),
+      ],
+    };
+  },
+};
+
+export const RelayGateStage: NexusStage = {
+  name: "Relay Gate",
+  async run(context) {
+    if (context.terminal) {
+      return terminalStage(this.name, context);
+    }
+
+    if (context.mode !== "peer_send" && context.mode !== "qr_share") {
+      return {
+        context,
+        stage: {
+          component: this.name,
+          status: "skipped",
+          summary: `Relay gate not used for ${context.mode}.`,
+        },
+      };
+    }
+
+    const rankedRelayMessages = context.rankedRelayMessages ?? [];
+    const relayBlocked = await shouldRelayBlocked(context.repository);
+    const gateResult = applyRelayGate(
+      rankedRelayMessages,
+      context.mode === "peer_send" ? context.peerProfile : context.localProfile,
+      {
+        priorityFloor: 3,
+        blocked: relayBlocked,
+        blockedReason: "blocked by Sentinel - device locked",
+      },
+    );
+
+    const nextContext: PipelineContext = {
+      ...context,
+      selectedMessages: gateResult.selectedMessages,
+      relayGateMatchedTopics: gateResult.matchedTopics,
+      relayGateDroppedForFloor: gateResult.droppedForFloor,
+      relayGateDroppedForPreference: gateResult.droppedForPreference,
+      relayBlocked: gateResult.sentinelBlocked,
+      relayBlockedReason: gateResult.reason,
+    };
+
+    if (gateResult.sentinelBlocked) {
+      return {
+        context: nextContext,
+        stage: {
+          component: this.name,
+          status: "warning",
+          summary: "Blocked by Sentinel - device locked.",
+          inputCount: rankedRelayMessages.length,
+          outputCount: 0,
+          sentinelBlocked: true,
+        },
+        events: [
+          makeEvent(
+            this.name,
+            "warning",
+            "blocked by Sentinel - device locked",
+            {
+              inputCount: rankedRelayMessages.length,
+              outputCount: 0,
+              sentinelBlocked: true,
+            },
+          ),
+        ],
+      };
+    }
+
+    return {
+      context: nextContext,
+      stage: {
+        component: this.name,
+        status: "success",
+        summary: `Passed ${gateResult.selectedMessages.length} of ${rankedRelayMessages.length} messages through Relay Gate.`,
+        inputCount: rankedRelayMessages.length,
+        outputCount: gateResult.selectedMessages.length,
+        matchedTopics: gateResult.matchedTopics,
+        droppedForFloor: gateResult.droppedForFloor,
+        droppedForPreference: gateResult.droppedForPreference,
+      },
+      events: [
+        makeEvent(
+          this.name,
+          gateResult.selectedMessages.length > 0 ? "success" : "warning",
+          `Relay Gate passed ${gateResult.selectedMessages.length}/${rankedRelayMessages.length} messages.`,
+          {
+            inputCount: rankedRelayMessages.length,
+            outputCount: gateResult.selectedMessages.length,
+            matchedTopics: gateResult.matchedTopics,
+            droppedForFloor: gateResult.droppedForFloor,
+            droppedForPreference: gateResult.droppedForPreference,
+          },
         ),
       ],
     };
@@ -583,6 +814,29 @@ export const StorageStage: NexusStage = {
       };
     }
 
+    if (context.candidateMessage.supersedes) {
+      const oldMessage = await context.repository.getById(
+        context.candidateMessage.supersedes,
+      );
+      if (oldMessage) {
+        await context.repository.put({
+          id: oldMessage.id,
+          type: oldMessage.type,
+          priority: oldMessage.priority,
+          ttl: oldMessage.ttl,
+          created_at: oldMessage.created_at,
+          hop_count: oldMessage.hop_count,
+          weight: oldMessage.weight,
+          payload: oldMessage.payload,
+          crucial_topics: oldMessage.crucial_topics,
+          confidence: oldMessage.confidence,
+          supersedes: oldMessage.supersedes,
+          superseded_by: context.candidateMessage.id,
+          schema_version: oldMessage.schema_version,
+        });
+      }
+    }
+
     await context.repository.put(context.candidateMessage);
     const stored = await context.repository.getById(
       context.candidateMessage.id,
@@ -621,25 +875,56 @@ export const QRShareStage: NexusStage = {
     }
 
     if (context.mode === "qr_share") {
-      const source =
-        context.selectedMessages ?? (await context.repository.getAllRaw());
-      const prioritized = prioritizeMessagesForProfile(
-        source,
-        context.localProfile,
-      );
-      const snapshot = buildSnapshot(prioritized);
+      const source = context.selectedMessages ?? [];
+      if (source.length === 0) {
+        return {
+          context,
+          stage: {
+            component: this.name,
+            status: context.relayBlocked ? "warning" : "skipped",
+            summary: context.relayBlocked
+              ? "Snapshot share blocked by Sentinel."
+              : "No messages passed Relay Gate for snapshot sharing.",
+            inputCount: 0,
+            outputCount: 0,
+            sentinelBlocked: context.relayBlocked,
+          },
+          events: [
+            makeEvent(
+              this.name,
+              context.relayBlocked ? "warning" : "skipped",
+              context.relayBlocked
+                ? "Snapshot share blocked by Sentinel."
+                : "No messages passed Relay Gate for snapshot sharing.",
+              {
+                inputCount: 0,
+                outputCount: 0,
+                sentinelBlocked: context.relayBlocked,
+              },
+            ),
+          ],
+        };
+      }
+
+      const snapshot = buildSnapshot(source);
       return {
         context: { ...context, snapshot },
         stage: {
           component: this.name,
           status: "success",
           summary: `Built snapshot QR with ${snapshot.count} messages.`,
+          inputCount: source.length,
+          outputCount: snapshot.count,
         },
         events: [
           makeEvent(
             this.name,
             "success",
             `Encoded snapshot bundle with ${snapshot.count} top relay messages.`,
+            {
+              inputCount: source.length,
+              outputCount: snapshot.count,
+            },
           ),
         ],
       };
@@ -674,17 +959,39 @@ export const QRShareStage: NexusStage = {
   },
 };
 
-const ALL_STAGES: NexusStage[] = [
-  IngestionStage,
-  PrivacyStage,
-  RelayEngineStage,
-  StorageStage,
-  QRShareStage,
-];
+const PIPELINE_STAGES: Record<PipelineMode, NexusStage[]> = {
+  compose: [
+    IngestionStage,
+    PrivacyStage,
+    ClassifierStage,
+    StorageStage,
+    PrioritizationAgentStage,
+  ],
+  peer_receive: [
+    IngestionStage,
+    PrivacyStage,
+    ClassifierStage,
+    StorageStage,
+    PrioritizationAgentStage,
+  ],
+  peer_send: [
+    BloomFilterStage,
+    PrioritizationAgentStage,
+    RelayGateStage,
+    StorageStage,
+  ],
+  qr_share: [
+    PrioritizationAgentStage,
+    RelayGateStage,
+    QRShareStage,
+    StorageStage,
+  ],
+  qr_ingest: [IngestionStage, QRShareStage],
+};
 
 async function runPipeline(
   context: PipelineContext,
-  stages = ALL_STAGES,
+  stages = PIPELINE_STAGES[context.mode],
 ): Promise<{ run: PipelineRun; context: PipelineContext }> {
   const startedAt = Date.now();
   let current = context;
@@ -704,31 +1011,46 @@ async function runPipeline(
     ? current.terminal.status === "invalid"
       ? "failed"
       : "partial"
+    : current.relayBlocked
+      ? "partial"
     : "completed";
 
   const summary =
     current.terminal?.reason ??
+    current.relayBlockedReason ??
+    (context.mode === "qr_share" &&
+    !current.snapshot &&
+    current.selectedMessages &&
+    current.selectedMessages.length === 0
+      ? "No messages passed Relay Gate for snapshot sharing."
+      : undefined) ??
     (current.snapshot
       ? `Snapshot ready with ${current.snapshot.count} messages.`
       : current.persistedMessage
         ? `Stored ${current.persistedMessage.id}.`
         : current.selectedMessages
           ? `Selected ${current.selectedMessages.length} relay messages.`
-          : current.receiveResults
+      : current.receiveResults
             ? `Processed ${current.receiveResults.length} inbound messages.`
             : "Pipeline completed.");
+
+  const runId = createSessionId();
 
   return {
     context: current,
     run: {
-      id: createSessionId(),
+      id: runId,
       mode: context.mode,
       status,
       summary,
       startedAt,
       completedAt: Date.now(),
       stages: stageResults,
-      events,
+      events: events.map((event) => ({
+        ...event,
+        runId,
+        mode: context.mode,
+      })),
     },
   };
 }

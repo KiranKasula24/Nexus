@@ -1,5 +1,6 @@
 export * from "./constants";
 export * from "./agent-runtime";
+export * from "./classifier";
 export * from "./db";
 export * from "./phase1";
 export * from "./phase2";

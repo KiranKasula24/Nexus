@@ -11,6 +11,7 @@ import type { NexusRepository } from "./repository";
 
 const LEVEL2_ATTEMPTS_KEY = "nexus.level2.pin_attempts";
 const PIN_HASH_KEY = "pin_hash";
+export const SENTINEL_LOCKED_KEY = "sentinel.locked";
 
 function accelerationMagnitude(event: DeviceMotionEvent): number {
   const x = event.accelerationIncludingGravity?.x ?? 0;
@@ -48,6 +49,19 @@ export async function loadPinHash(
   repository: NexusRepository,
 ): Promise<string | undefined> {
   return repository.getSystemState<string>(PIN_HASH_KEY);
+}
+
+export async function setRelayBlockedState(
+  repository: NexusRepository,
+  blocked: boolean,
+): Promise<void> {
+  await repository.setSystemState(SENTINEL_LOCKED_KEY, blocked);
+}
+
+export async function shouldRelayBlocked(
+  repository: NexusRepository,
+): Promise<boolean> {
+  return (await repository.getSystemState<boolean>(SENTINEL_LOCKED_KEY)) ?? false;
 }
 
 export async function verifyPin(

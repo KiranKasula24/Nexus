@@ -45,6 +45,39 @@ function payloadContainsKeyword(payload: string, keyword: string): boolean {
   return payload.toLowerCase().includes(keyword);
 }
 
+export function profileKeywordList(profile?: NexusUserProfile): string[] {
+  if (!profile) return [];
+  return profileKeywords(profile);
+}
+
+export function messageProfileMatches(
+  message: NexusMessage,
+  profile?: NexusUserProfile,
+): { matched: boolean; matchedTopics: string[] } {
+  if (!profile) {
+    return { matched: false, matchedTopics: [] };
+  }
+
+  const keywords = profileKeywordList(profile);
+  if (keywords.length === 0) {
+    return { matched: false, matchedTopics: [] };
+  }
+
+  const topicSet = new Set(normalizeStringList(message.crucial_topics ?? []));
+  const matchedTopics = new Set<string>();
+
+  for (const keyword of keywords) {
+    if (topicSet.has(keyword) || payloadContainsKeyword(message.payload, keyword)) {
+      matchedTopics.add(keyword);
+    }
+  }
+
+  return {
+    matched: matchedTopics.size > 0,
+    matchedTopics: [...matchedTopics],
+  };
+}
+
 export function scoreMessageForProfile(
   message: NexusMessage,
   profile?: NexusUserProfile,
