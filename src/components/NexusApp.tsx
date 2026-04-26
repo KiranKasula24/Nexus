@@ -79,7 +79,7 @@ interface DevState {
 }
 
 const SIGNALING_HOST_KEY = "nexus_signaling_host";
-const DEFAULT_SIGNALING_HOST = "10.70.51.133:3000";
+const DEFAULT_SIGNALING_HOST = "nexus-8nw1.vercel.app";
 
 function classNames(
   ...parts: Array<string | false | null | undefined>
