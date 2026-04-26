@@ -450,14 +450,9 @@ export function NexusApp() {
       return;
     }
 
-    const dismissed =
-      window.localStorage.getItem(INSTALL_BANNER_DISMISSED_KEY) === "true";
-
     const handleBeforeInstallPrompt = (event: Event) => {
-      if (dismissed) return;
-      event.preventDefault();
       setInstallPromptEvent(event as BeforeInstallPromptEvent);
-      setInstallBannerVisible(true);
+      setInstallBannerVisible(false);
     };
 
     const handleAppInstalled = () => {
