@@ -325,7 +325,6 @@ export function NexusApp() {
   const [draftText, setDraftText] = useState("");
   const [draftImageDataUrl, setDraftImageDataUrl] = useState("");
   const [draftPriority, setDraftPriority] = useState<1 | 2 | 3 | 4 | 5>(4);
-  const [draftType, setDraftType] = useState<MessageType | null>(null);
   const [draftSupersedes, setDraftSupersedes] = useState<string | undefined>();
   const [draftTopicsInput, setDraftTopicsInput] = useState("");
 
@@ -802,7 +801,6 @@ export function NexusApp() {
       setDraftText(message.payload);
       setDraftImageDataUrl(message.media_data_url ?? "");
       setDraftPriority(message.priority);
-      setDraftType(message.type);
       setDraftSupersedes(message.id);
       setDraftTopicsInput((message.crucial_topics ?? []).join(", "));
       setSelectedMessage(null);
@@ -815,7 +813,6 @@ export function NexusApp() {
       setDraftText("");
       setDraftImageDataUrl("");
       setDraftPriority(4);
-      setDraftType(null);
       setDraftSupersedes(undefined);
       setDraftTopicsInput((userProfile?.crucialTopics ?? []).join(", "));
     }
@@ -910,20 +907,12 @@ export function NexusApp() {
   async function handleSaveDraft(): Promise<void> {
     if (!repositoryRef.current) return;
 
-    if (!draftType) {
-      noteStatus("warning", "Choose a message type");
-      return;
-    }
-
-    if (draftType === "image" && !draftImageDataUrl) {
-      noteStatus("warning", "Choose an image to transfer");
-      return;
-    }
-
-    if (draftType !== "image" && !draftText.trim()) {
+    if (!draftImageDataUrl && !draftText.trim()) {
       noteStatus("warning", "Message is empty");
       return;
     }
+
+    const draftType: MessageType = draftImageDataUrl ? "image" : "text";
 
     const result = await runComposePipeline(repositoryRef.current, {
       type: draftType,
@@ -953,7 +942,6 @@ export function NexusApp() {
 
     setDraftText("");
     setDraftImageDataUrl("");
-    setDraftType(null);
     setDraftSupersedes(undefined);
     setDraftTopicsInput((userProfile?.crucialTopics ?? []).join(", "));
     setSection("relay");
@@ -2228,78 +2216,48 @@ export function NexusApp() {
                 </div>
               )}
 
-              <div>
-                <p className="text-sm text-[#5a6472]">
-                  Message type is required
-                </p>
-                <div className="mt-3 grid grid-cols-3 gap-2">
-                  {(["text", "alert", "audio", "image"] as MessageType[]).map((type) => (
-                    <button
-                      key={type}
-                      type="button"
-                      onClick={() => setDraftType(type)}
-                      className={classNames(
-                        "rounded-[1.1rem] px-3 py-3.5 text-sm font-semibold transition duration-150 active:scale-[0.98]",
-                        draftType === type
-                          ? "bg-[#102033] text-white"
-                          : "bg-white text-[#102033]",
-                      )}
-                    >
-                      {messageLabel(type)}
-                    </button>
-                  ))}
-                </div>
-                {!draftType && (
-                  <p className="mt-2 text-sm text-amber-900">
-                    Choose whether this is a text update, alert, audio note, or image before saving.
-                  </p>
+              <div className="space-y-3 rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4">
+                <label className="block text-sm text-[#5a6472]">
+                  Optional image
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (!file) {
+                        setDraftImageDataUrl("");
+                        return;
+                      }
+                      void fileToDataUrl(file)
+                        .then((dataUrl) => {
+                          setDraftImageDataUrl(dataUrl);
+                          if (!draftText.trim()) {
+                            setDraftText(file.name.replace(/\.[^.]+$/, ""));
+                          }
+                        })
+                        .catch((error: unknown) => {
+                          noteStatus(
+                            "danger",
+                            error instanceof Error
+                              ? error.message
+                              : "Could not read image",
+                          );
+                        });
+                    }}
+                    className="mt-2 block w-full text-sm text-[#102033]"
+                  />
+                </label>
+                {draftImageDataUrl && (
+                  <Image
+                    src={draftImageDataUrl}
+                    alt={draftText || "Selected image"}
+                    width={1200}
+                    height={800}
+                    unoptimized
+                    className="h-52 w-full rounded-[1.2rem] object-cover"
+                  />
                 )}
               </div>
-
-              {draftType === "image" && (
-                <div className="space-y-3 rounded-[1.4rem] border border-[#d7cfbe] bg-white/80 p-4">
-                  <label className="block text-sm text-[#5a6472]">
-                    Select image
-                    <input
-                      type="file"
-                      accept="image/*"
-                      onChange={(event) => {
-                        const file = event.target.files?.[0];
-                        if (!file) {
-                          setDraftImageDataUrl("");
-                          return;
-                        }
-                        void fileToDataUrl(file)
-                          .then((dataUrl) => {
-                            setDraftImageDataUrl(dataUrl);
-                            if (!draftText.trim()) {
-                              setDraftText(file.name.replace(/\.[^.]+$/, ""));
-                            }
-                          })
-                          .catch((error: unknown) => {
-                            noteStatus(
-                              "danger",
-                              error instanceof Error
-                                ? error.message
-                                : "Could not read image",
-                            );
-                          });
-                      }}
-                      className="mt-2 block w-full text-sm text-[#102033]"
-                    />
-                  </label>
-                  {draftImageDataUrl && (
-                    <Image
-                      src={draftImageDataUrl}
-                      alt={draftText || "Selected image"}
-                      width={1200}
-                      height={800}
-                      unoptimized
-                      className="h-52 w-full rounded-[1.2rem] object-cover"
-                    />
-                  )}
-                </div>
-              )}
 
               <textarea
                 value={draftText}
@@ -2308,7 +2266,7 @@ export function NexusApp() {
                   "h-44 w-full rounded-[1.5rem] border border-[#d8d0bf] bg-white px-4 py-4 text-base text-[#102033] outline-none",
                 )}
                 placeholder={
-                  draftType === "image"
+                  draftImageDataUrl
                     ? "Optional caption for this image."
                     : "Road blocked at main gate."
                 }
@@ -2373,7 +2331,6 @@ export function NexusApp() {
                     onClick={() => {
                       setDraftText("");
                       setDraftImageDataUrl("");
-                      setDraftType(null);
                       setDraftSupersedes(undefined);
                       setSection("relay");
                   }}
@@ -2387,12 +2344,7 @@ export function NexusApp() {
                   type="button"
                   onClick={() => void handleSaveDraft()}
                   className={pressableCardClasses(
-                    classNames(
-                      "rounded-[1.3rem] px-4 py-4 text-sm font-semibold",
-                      draftType
-                        ? "bg-[#102033] text-white"
-                        : "bg-[#102033] text-white",
-                    ),
+                    "rounded-[1.3rem] bg-[#102033] px-4 py-4 text-sm font-semibold text-white",
                   )}
                 >
                   Save Message
