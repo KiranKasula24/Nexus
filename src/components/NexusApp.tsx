@@ -2386,13 +2386,12 @@ export function NexusApp() {
                 <button
                   type="button"
                   onClick={() => void handleSaveDraft()}
-                  disabled={!draftType}
                   className={pressableCardClasses(
                     classNames(
                       "rounded-[1.3rem] px-4 py-4 text-sm font-semibold",
                       draftType
                         ? "bg-[#102033] text-white"
-                        : "cursor-not-allowed bg-[#d9d1c4] text-[#786f60]",
+                        : "bg-[#102033] text-white",
                     ),
                   )}
                 >
