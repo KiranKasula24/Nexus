@@ -80,6 +80,10 @@ interface DevState {
 
 const SIGNALING_HOST_KEY = "nexus_signaling_host";
 const DEFAULT_SIGNALING_HOST = "nexus-8nw1.vercel.app";
+const SIGNAL_ROOM_CODE_LENGTH = 6;
+const SIGNAL_ROOM_CODE_PATTERN = new RegExp(
+  `^\\d{${SIGNAL_ROOM_CODE_LENGTH}}$`,
+);
 
 function classNames(
   ...parts: Array<string | false | null | undefined>
@@ -110,6 +114,10 @@ function messageLabel(type: MessageType): string {
   if (type === "alert") return "Alert";
   if (type === "audio") return "Audio";
   return "Text";
+}
+
+function formatRoomCode(room: string): string {
+  return room.replace(/(\d{3})(?=\d)/g, "$1 ");
 }
 
 function formatRelativeTone(
@@ -425,16 +433,29 @@ export function NexusApp() {
     return normalizedSaved;
   }
 
-  function buildSignalUrl(room: string, role?: "offer" | "answer"): string {
+  function buildSignalApiUrl(path: string): string {
     const safeHost = normalizeSignalingHostValue(
       signalingHost || runtimeDefaultHost(),
     );
     const preferHttp =
       isLoopbackHost(stripPort(safeHost)) || isIpHost(stripPort(safeHost));
     const protocol = preferHttp ? "http" : "https";
-    const base = `${protocol}://${safeHost}/api/signal/${room}`;
+    return `${protocol}://${safeHost}${path}`;
+  }
+
+  function buildSignalRoomUrl(room: string, role?: "offer" | "answer"): string {
+    const base = buildSignalApiUrl(`/api/signal/${room}`);
     if (!role) return base;
     return `${base}?role=${role}`;
+  }
+
+  function buildSignalRoomsUrl(): string {
+    return buildSignalApiUrl("/api/signal/rooms");
+  }
+
+  function closePeerArtifacts(peer: PeerArtifacts | null): void {
+    peer?.channel.close();
+    peer?.connection.close();
   }
 
   function clearAnswerPolling(): void {
@@ -445,13 +466,41 @@ export function NexusApp() {
     answerPollingDeadlineRef.current = null;
   }
 
+  async function createSignalRoom(offerSdp: string): Promise<string> {
+    const url = buildSignalRoomsUrl();
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ offerSdp }),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "network error";
+      throw new Error(`Failed to create room at ${url}: ${message}`);
+    }
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(
+        `Failed to create room at ${url}. Status ${response.status}. ${body}`,
+      );
+    }
+
+    const payload = (await response.json()) as { room?: string };
+    if (!payload.room) {
+      throw new Error(`Signal server returned no room code from ${url}.`);
+    }
+
+    return payload.room;
+  }
+
   async function postSignal(
     room: string,
-    role: "offer" | "answer",
+    role: "answer",
     sdp: string,
   ): Promise<void> {
-    const url = buildSignalUrl(room);
-    console.log("postSignal URL:", url);
+    const url = buildSignalRoomUrl(room);
     let response: Response;
     try {
       response = await fetch(url, {
@@ -476,7 +525,7 @@ export function NexusApp() {
     room: string,
     role: "offer" | "answer",
   ): Promise<string | null> {
-    const url = buildSignalUrl(room, role);
+    const url = buildSignalRoomUrl(room, role);
     let response: Response;
     try {
       response = await fetch(url);
@@ -1071,9 +1120,8 @@ export function NexusApp() {
     clearAnswerPolling();
 
     try {
-      const generatedRoom = Math.floor(1000 + Math.random() * 9000).toString();
-      setRoomCode(generatedRoom);
-      setConnectStatusMessage("Waiting for other device...");
+      setRoomCode("");
+      setConnectStatusMessage("Creating secure room...");
       setConnectStep("initiator_show_code");
       setSection("connect");
 
@@ -1085,7 +1133,9 @@ export function NexusApp() {
         lastOfferToken: result.offerToken,
       }));
 
-      await postSignal(generatedRoom, "offer", result.offerToken);
+      const createdRoom = await createSignalRoom(result.offerToken);
+      setRoomCode(createdRoom);
+      setConnectStatusMessage("Waiting for other device...");
 
       answerPollingDeadlineRef.current = Date.now() + 120_000;
       answerPollingRef.current = window.setInterval(() => {
@@ -1100,7 +1150,7 @@ export function NexusApp() {
 
         void (async () => {
           try {
-            const answerSdp = await getSignal(generatedRoom, "answer");
+            const answerSdp = await getSignal(createdRoom, "answer");
             if (!answerSdp) return;
 
             clearAnswerPolling();
@@ -1134,7 +1184,7 @@ export function NexusApp() {
       }, 2_000);
 
       if (isReconnect) {
-        setReconnectRoomCode(generatedRoom);
+        setReconnectRoomCode(createdRoom);
         setShowReconnectBanner(true);
         setConnectStatusMessage("Waiting for other device...");
       } else {
@@ -1146,16 +1196,26 @@ export function NexusApp() {
       pushDevLog(
         "active",
         isReconnect ? "Reconnect room created" : "Room created",
-        `Created room ${generatedRoom} and published offer token.`,
+        `Created room ${createdRoom} and published offer token.`,
       );
     } catch (error) {
       clearAnswerPolling();
+      intentionalCloseRef.current = true;
+      closePeerArtifacts(offerPeerRef.current);
+      offerPeerRef.current = null;
+      syncChannelRef.current = null;
+      setRoomCode("");
+      setConnectStep("pick_role");
       setConnectStatusMessage(
         error instanceof Error
           ? error.message
           : "Unable to contact signaling server.",
       );
-      noteStatus("danger", "Connection setup failed");
+      noteStatus(
+        "danger",
+        "Connection setup failed",
+        error instanceof Error ? error.message : "Unable to contact signaling server.",
+      );
     }
   }
 
@@ -1166,8 +1226,10 @@ export function NexusApp() {
     }
 
     const room = enteredCode.trim();
-    if (!/^\d{4}$/.test(room)) {
-      setConnectStatusMessage("Enter a valid 4-digit room code.");
+    if (!SIGNAL_ROOM_CODE_PATTERN.test(room)) {
+      setConnectStatusMessage(
+        `Enter a valid ${SIGNAL_ROOM_CODE_LENGTH}-digit room code.`,
+      );
       return;
     }
 
@@ -1195,6 +1257,10 @@ export function NexusApp() {
       setSyncText("Handshake completed. Waiting for WebRTC link.");
       pushDevLog("active", "Joined room", `Submitted answer for room ${room}.`);
     } catch (error) {
+      intentionalCloseRef.current = true;
+      closePeerArtifacts(joinerPeerRef.current);
+      joinerPeerRef.current = null;
+      syncChannelRef.current = null;
       setConnectStatusMessage(
         error instanceof Error
           ? error.message
@@ -1497,8 +1563,8 @@ export function NexusApp() {
                 <div className="rounded-[1.4rem] border border-amber-200 bg-amber-50 px-4 py-4 text-[#102033]">
                   <p className="text-sm font-semibold">Peer disconnected.</p>
                   <p className="mt-1 text-sm text-[#5a6472]">
-                    Reconnecting - share code {reconnectRoomCode} with the other
-                    device.
+                    Reconnecting - share code{" "}
+                    {formatRoomCode(reconnectRoomCode)} with the other device.
                   </p>
                   <button
                     type="button"
@@ -2005,7 +2071,7 @@ export function NexusApp() {
                   >
                     <span className="block text-2xl font-semibold">Share</span>
                     <span className="mt-2 block text-sm text-white/70">
-                      Generate a 4-digit room code
+                      Generate a secure 6-digit room code
                     </span>
                   </button>
 
@@ -2024,7 +2090,7 @@ export function NexusApp() {
                       Receive
                     </span>
                     <span className="mt-2 block text-sm text-[#5a6472]">
-                      Enter a 4-digit room code
+                      Enter a secure 6-digit room code
                     </span>
                   </button>
 
@@ -2047,8 +2113,8 @@ export function NexusApp() {
                     Share this room code
                   </h2>
                   <div className="mt-5 rounded-[1.6rem] bg-white p-8 text-center shadow-[0_18px_60px_rgba(16,32,51,0.14)]">
-                    <p className="text-5xl font-bold tracking-[0.5em] text-[#102033]">
-                      {roomCode || "----"}
+                    <p className="text-5xl font-bold tracking-[0.35em] text-[#102033]">
+                      {roomCode ? formatRoomCode(roomCode) : "------"}
                     </p>
                   </div>
                   <p className="mt-4 text-sm text-[#5a6472]">
@@ -2087,13 +2153,15 @@ export function NexusApp() {
                     value={joinRoomCode}
                     onChange={(event) =>
                       setJoinRoomCode(
-                        event.target.value.replace(/\D/g, "").slice(0, 4),
+                        event.target.value
+                          .replace(/\D/g, "")
+                          .slice(0, SIGNAL_ROOM_CODE_LENGTH),
                       )
                     }
-                    className="mt-4 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-center text-3xl tracking-[0.4em] text-[#102033] outline-none"
+                    className="mt-4 w-full rounded-[1.2rem] border border-[#d8d0bf] bg-white px-4 py-3 text-center text-3xl tracking-[0.3em] text-[#102033] outline-none"
                     inputMode="numeric"
-                    maxLength={4}
-                    placeholder="0000"
+                    maxLength={SIGNAL_ROOM_CODE_LENGTH}
+                    placeholder="000000"
                   />
                   {!!connectStatusMessage && (
                     <p className="mt-3 text-sm text-[#5a6472]">
