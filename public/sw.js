@@ -1,5 +1,5 @@
-const CACHE_NAME = "nexus-v1";
-const SHELL_URLS = ["/", "/manifest.json"];
+const CACHE_NAME = "nexus-v2";
+const SHELL_URLS = ["/", "/manifest.json", "/offline.html"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -21,6 +21,12 @@ self.addEventListener("activate", (event) => {
       )
       .then(() => self.clients.claim()),
   );
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "SKIP_WAITING") {
+    self.skipWaiting();
+  }
 });
 
 self.addEventListener("fetch", (event) => {
