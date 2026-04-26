@@ -156,6 +156,11 @@ function isLoopbackHost(host: string): boolean {
   );
 }
 
+function isIpHost(host: string): boolean {
+  const withoutPort = host.replace(/:\d+$/, "");
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(withoutPort);
+}
+
 function toRawMessage(message: NexusMessageWithComputed): NexusMessage {
   return {
     id: message.id,
@@ -377,8 +382,8 @@ export function NexusApp() {
     }
 
     const hostname = window.location.hostname;
-    const port = window.location.port || "3000";
-    return `${hostname}:${port}`;
+    const port = window.location.port;
+    return port ? `${hostname}:${port}` : hostname;
   }
 
   function resolveSignalingHost(saved: string | null): string {
@@ -404,7 +409,9 @@ export function NexusApp() {
 
   function buildSignalUrl(room: string, role?: "offer" | "answer"): string {
     const safeHost = signalingHost || runtimeDefaultHost();
-    const base = `http://${safeHost}/api/signal/${room}`;
+    const preferHttp = isLoopbackHost(safeHost) || isIpHost(safeHost);
+    const protocol = preferHttp ? "http" : "https";
+    const base = `${protocol}://${safeHost}/api/signal/${room}`;
     if (!role) return base;
     return `${base}?role=${role}`;
   }
@@ -1029,68 +1036,78 @@ export function NexusApp() {
 
     clearAnswerPolling();
 
-    const generatedRoom = Math.floor(1000 + Math.random() * 9000).toString();
-    setRoomCode(generatedRoom);
-    setConnectStatusMessage("Waiting for other device...");
-    setConnectStep("initiator_show_code");
-    setSection("connect");
+    try {
+      const generatedRoom = Math.floor(1000 + Math.random() * 9000).toString();
+      setRoomCode(generatedRoom);
+      setConnectStatusMessage("Waiting for other device...");
+      setConnectStep("initiator_show_code");
+      setSection("connect");
 
-    const result = await createInitiator();
-    await attachPeer(result.peer, "initiator");
+      const result = await createInitiator();
+      await attachPeer(result.peer, "initiator");
 
-    setDevState((current) => ({
-      ...current,
-      lastOfferToken: result.offerToken,
-    }));
+      setDevState((current) => ({
+        ...current,
+        lastOfferToken: result.offerToken,
+      }));
 
-    await postSignal(generatedRoom, "offer", result.offerToken);
+      await postSignal(generatedRoom, "offer", result.offerToken);
 
-    answerPollingDeadlineRef.current = Date.now() + 120_000;
-    answerPollingRef.current = window.setInterval(() => {
-      if (
-        !answerPollingDeadlineRef.current ||
-        Date.now() > answerPollingDeadlineRef.current
-      ) {
-        clearAnswerPolling();
-        setConnectStatusMessage("Timed out waiting for other device.");
-        return;
+      answerPollingDeadlineRef.current = Date.now() + 120_000;
+      answerPollingRef.current = window.setInterval(() => {
+        if (
+          !answerPollingDeadlineRef.current ||
+          Date.now() > answerPollingDeadlineRef.current
+        ) {
+          clearAnswerPolling();
+          setConnectStatusMessage("Timed out waiting for other device.");
+          return;
+        }
+
+        void (async () => {
+          try {
+            const answerSdp = await getSignal(generatedRoom, "answer");
+            if (!answerSdp) return;
+
+            clearAnswerPolling();
+            setConnectStatusMessage("Answer received, connecting...");
+
+            if (!offerPeerRef.current) {
+              setConnectStatusMessage("Offer session expired. Start again.");
+              return;
+            }
+
+            await finalizeInitiator(offerPeerRef.current.connection, answerSdp);
+          } catch {
+            setConnectStatusMessage("Waiting for other device...");
+          }
+        })();
+      }, 2_000);
+
+      if (isReconnect) {
+        setReconnectRoomCode(generatedRoom);
+        setShowReconnectBanner(true);
+        setConnectStatusMessage("Waiting for other device...");
+      } else {
+        setShowReconnectBanner(false);
+        setReconnectRoomCode("");
       }
 
-      void (async () => {
-        try {
-          const answerSdp = await getSignal(generatedRoom, "answer");
-          if (!answerSdp) return;
-
-          clearAnswerPolling();
-          setConnectStatusMessage("Answer received, connecting...");
-
-          if (!offerPeerRef.current) {
-            setConnectStatusMessage("Offer session expired. Start again.");
-            return;
-          }
-
-          await finalizeInitiator(offerPeerRef.current.connection, answerSdp);
-        } catch {
-          setConnectStatusMessage("Waiting for other device...");
-        }
-      })();
-    }, 2_000);
-
-    if (isReconnect) {
-      setReconnectRoomCode(generatedRoom);
-      setShowReconnectBanner(true);
-      setConnectStatusMessage("Waiting for other device...");
-    } else {
-      setShowReconnectBanner(false);
-      setReconnectRoomCode("");
+      setSyncText("Share the room code with the other device.");
+      pushDevLog(
+        "active",
+        isReconnect ? "Reconnect room created" : "Room created",
+        `Created room ${generatedRoom} and published offer token.`,
+      );
+    } catch (error) {
+      clearAnswerPolling();
+      setConnectStatusMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to contact signaling server.",
+      );
+      noteStatus("danger", "Connection setup failed");
     }
-
-    setSyncText("Share the room code with the other device.");
-    pushDevLog(
-      "active",
-      isReconnect ? "Reconnect room created" : "Room created",
-      `Created room ${generatedRoom} and published offer token.`,
-    );
   }
 
   async function handleJoinerSubmit(enteredCode: string): Promise<void> {
